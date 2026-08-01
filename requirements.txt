@@ -1,0 +1,6 @@
+google-api-python-client
+google-auth
+google-auth-oauthlib
+Pillow
+numpy
+moviepy==1.0.3
