@@ -1,13 +1,11 @@
 import os
 import sys
-import json
 import random
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import ImageSequenceClip, AudioFileClip
 
-from google.oauth2.service_account import Credentials as SACredentials
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -33,23 +31,27 @@ OUTPUT_DIR = "output"
 # -----------------------------------------
 
 
-def get_sheets_service():
-    creds = SACredentials.from_service_account_info(
-        json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"]),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return build("sheets", "v4", credentials=creds)
-
-
-def get_youtube_service():
-    creds = UserCredentials(
+def get_user_credentials():
+    """Single OAuth credential (your own Google account) used for both
+    Sheets and YouTube — avoids needing a service account entirely."""
+    return UserCredentials(
         None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
         client_id=os.environ["YT_CLIENT_ID"],
         client_secret=os.environ["YT_CLIENT_SECRET"],
         token_uri="https://oauth2.googleapis.com/token",
-        scopes=["https://www.googleapis.com/auth/youtube.upload"],
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/youtube.upload",
+        ],
     )
+
+
+def get_sheets_service(creds):
+    return build("sheets", "v4", credentials=creds)
+
+
+def get_youtube_service(creds):
     return build("youtube", "v3", credentials=creds)
 
 
@@ -197,7 +199,8 @@ def upload_to_youtube(youtube, video_path, verse_text, reference_text):
 
 
 def main():
-    sheets_service = get_sheets_service()
+    creds = get_user_credentials()
+    sheets_service = get_sheets_service(creds)
     row_number, verse_text, reference_text = fetch_next_verse(sheets_service)
 
     if not verse_text:
@@ -208,7 +211,7 @@ def main():
 
     video_path = build_video(verse_text, reference_text)
 
-    youtube_service = get_youtube_service()
+    youtube_service = get_youtube_service(creds)
     upload_to_youtube(youtube_service, video_path, verse_text, reference_text)
 
     mark_verse_used(sheets_service, row_number)
