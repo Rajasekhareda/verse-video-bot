@@ -150,11 +150,11 @@ def wrap_text(draw, text, font, max_width):
     return lines
 
 
-def render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size, font_path):
+def render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size, verse_font_path, ref_font_path):
     img = background.copy()
     draw = ImageDraw.Draw(img)
-    verse_font = ImageFont.truetype(font_path, VERSE_FONT_SIZE)
-    ref_font = ImageFont.truetype(font_path, REF_FONT_SIZE)
+    verse_font = ImageFont.truetype(verse_font_path, VERSE_FONT_SIZE)
+    ref_font = ImageFont.truetype(ref_font_path, REF_FONT_SIZE)
 
     visible_text = verse_text[:chars_to_show]
     max_width = size[0] - 160
@@ -189,7 +189,8 @@ def build_video(verse_text, reference_text):
     background = make_gradient_background(VIDEO_SIZE)
     size = VIDEO_SIZE
 
-    font_path = FONT_PATH_TELUGU if is_telugu(verse_text) else FONT_PATH_LATIN
+    verse_font_path = FONT_PATH_TELUGU if is_telugu(verse_text) else FONT_PATH_LATIN
+    ref_font_path = FONT_PATH_TELUGU if is_telugu(reference_text) else FONT_PATH_LATIN
 
     total_frames = VIDEO_DURATION * FPS
     n_chars = len(verse_text)
@@ -204,7 +205,7 @@ def build_video(verse_text, reference_text):
             chars_to_show = n_chars
             show_reference = True
         frames.append(
-            render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size, font_path)
+            render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size, verse_font_path, ref_font_path)
         )
 
     clip = ImageSequenceClip(frames, fps=FPS)
