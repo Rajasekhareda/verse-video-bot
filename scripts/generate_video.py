@@ -3,7 +3,7 @@ import sys
 import random
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from moviepy.editor import ImageSequenceClip, AudioFileClip
 
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -14,21 +14,70 @@ from googleapiclient.http import MediaFileUpload
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
 
-BACKGROUND_IMAGE = os.environ.get("BACKGROUND_IMAGE", "assets/background.jpg")
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
-FONT_PATH = os.environ.get(
-    "FONT_PATH", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Two fonts: Telugu script needs its own font, English uses DejaVu.
+# The script auto-detects which one to use per verse — no manual choice needed.
+FONT_PATH_TELUGU = os.environ.get(
+    "FONT_PATH_TELUGU", "/usr/share/fonts/truetype/noto/NotoSansTelugu-Bold.ttf"
+)
+FONT_PATH_LATIN = os.environ.get(
+    "FONT_PATH_LATIN", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 )
 
-VIDEO_DURATION = 30        # seconds, fixed length
+VIDEO_DURATION = 45        # seconds, fixed length (extra room to add your own voiceover later)
 MUSIC_START_OFFSET = 10    # start music 10s into the track
 FPS = 24
 VERSE_FONT_SIZE = 60
 REF_FONT_SIZE = 40
-TYPEWRITER_SECONDS = 12    # how long it takes to "type" the full verse
+TYPEWRITER_SECONDS = 18    # how long it takes to "type" the full verse
+VIDEO_SIZE = (1280, 720)
 
 OUTPUT_DIR = "output"
 # -----------------------------------------
+
+# A handful of eye-catching, hand-picked gradient color pairs.
+# A new one is picked at random every run, so each video looks a little different.
+GRADIENT_PALETTES = [
+    ((15, 12, 45), (90, 30, 110)),     # midnight purple
+    ((10, 25, 55), (30, 90, 130)),     # deep ocean blue
+    ((40, 10, 30), (140, 40, 60)),     # wine red
+    ((10, 35, 30), (30, 110, 90)),     # emerald teal
+    ((45, 20, 10), (150, 80, 30)),     # sunset amber
+    ((20, 15, 50), (80, 60, 150)),     # indigo violet
+    ((5, 20, 25), (20, 80, 100)),      # deep teal
+    ((35, 10, 45), (120, 30, 100)),    # magenta plum
+]
+
+
+def is_telugu(text):
+    """True if the text contains Telugu-script characters (Unicode range 0C00–0C7F)."""
+    return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
+
+
+def make_gradient_background(size):
+    """Generates a fresh diagonal gradient with a soft vignette — different every run."""
+    top_color, bottom_color = random.choice(GRADIENT_PALETTES)
+    w, h = size
+    top = np.array(top_color, dtype=float)
+    bottom = np.array(bottom_color, dtype=float)
+
+    t = np.linspace(0, 1, h).reshape(h, 1, 1)
+    gradient = (top * (1 - t) + bottom * t).astype(np.uint8)
+    gradient = np.repeat(gradient, w, axis=1)
+    img = Image.fromarray(gradient, mode="RGB")
+
+    # subtle vignette for a more polished, "designed" look
+    vignette = Image.new("L", size, 0)
+    vdraw = ImageDraw.Draw(vignette)
+    vdraw.ellipse(
+        [-w * 0.3, -h * 0.3, w * 1.3, h * 1.3], fill=255
+    )
+    vignette = vignette.filter(ImageFilter.GaussianBlur(120))
+    dark = Image.new("RGB", size, (0, 0, 0))
+    img = Image.composite(img, dark, vignette)
+
+    return img
 
 
 def get_user_credentials():
@@ -101,11 +150,11 @@ def wrap_text(draw, text, font, max_width):
     return lines
 
 
-def render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size):
+def render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size, font_path):
     img = background.copy()
     draw = ImageDraw.Draw(img)
-    verse_font = ImageFont.truetype(FONT_PATH, VERSE_FONT_SIZE)
-    ref_font = ImageFont.truetype(FONT_PATH, REF_FONT_SIZE)
+    verse_font = ImageFont.truetype(font_path, VERSE_FONT_SIZE)
+    ref_font = ImageFont.truetype(font_path, REF_FONT_SIZE)
 
     visible_text = verse_text[:chars_to_show]
     max_width = size[0] - 160
@@ -136,8 +185,11 @@ def render_frame(background, verse_text, reference_text, chars_to_show, show_ref
 
 def build_video(verse_text, reference_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    background = Image.open(BACKGROUND_IMAGE).convert("RGB")
-    size = background.size
+
+    background = make_gradient_background(VIDEO_SIZE)
+    size = VIDEO_SIZE
+
+    font_path = FONT_PATH_TELUGU if is_telugu(verse_text) else FONT_PATH_LATIN
 
     total_frames = VIDEO_DURATION * FPS
     n_chars = len(verse_text)
@@ -152,7 +204,7 @@ def build_video(verse_text, reference_text):
             chars_to_show = n_chars
             show_reference = True
         frames.append(
-            render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size)
+            render_frame(background, verse_text, reference_text, chars_to_show, show_reference, size, font_path)
         )
 
     clip = ImageSequenceClip(frames, fps=FPS)
@@ -183,7 +235,7 @@ def upload_to_youtube(youtube, video_path, verse_text, reference_text):
             "categoryId": "22",
         },
         "status": {
-            "privacyStatus": "private"  # private = draft-like, review in YT Studio before publishing
+            "privacyStatus": "private"  # private = you can review/edit further in YT Studio before publishing
         },
     }
 
