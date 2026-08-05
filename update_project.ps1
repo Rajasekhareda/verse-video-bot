@@ -1,4 +1,11 @@
-﻿import os
+# HOW TO USE:
+# 1. Save this file directly INSIDE your verse-video-bot project folder
+#    (the same folder that has "scripts", "assets", ".github" in it).
+# 2. Open PowerShell in that folder and run:  .\update_project.ps1
+
+Write-Host "Writing updated scripts/generate_video.py..."
+$pyContent = @'
+import os
 import sys
 import random
 import unicodedata
@@ -18,7 +25,7 @@ SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
 
 # Two fonts: Telugu script needs its own font, English uses DejaVu.
-# Detected independently for the verse and the reference â€” no manual choice needed.
+# Detected independently for the verse and the reference — no manual choice needed.
 FONT_PATH_TELUGU = os.environ.get(
     "FONT_PATH_TELUGU", "/usr/share/fonts/truetype/noto/NotoSansTelugu-Bold.ttf"
 )
@@ -67,7 +74,7 @@ ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
 
 
 def is_telugu(text):
-    """True if the text contains Telugu-script characters (Unicode range 0C00â€“0C7F)."""
+    """True if the text contains Telugu-script characters (Unicode range 0C00–0C7F)."""
     return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
 
 
@@ -107,7 +114,7 @@ def pick_music_file():
         for f in music_files:
             if f.lower() == MUSIC_CHOICE.lower():
                 return os.path.join(MUSIC_DIR, f)
-        # requested file not found â€” fall back to random rather than crash
+        # requested file not found — fall back to random rather than crash
         print(f"Warning: '{MUSIC_CHOICE}' not found in {MUSIC_DIR}, picking randomly instead.")
 
     return os.path.join(MUSIC_DIR, random.choice(music_files))
@@ -131,7 +138,7 @@ def generate_hashtags(reference_text, verse_text):
 
 def get_user_credentials():
     """Single OAuth credential (your own Google account) used for both
-    Sheets and YouTube â€” avoids needing a service account entirely."""
+    Sheets and YouTube — avoids needing a service account entirely."""
     return UserCredentials(
         None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
@@ -317,13 +324,13 @@ def main():
     row_number = None
     if VERSE_OVERRIDE:
         verse_text, reference_text = VERSE_OVERRIDE, REFERENCE_OVERRIDE
-        print(f"Using override text: {verse_text} â€” {reference_text}")
+        print(f"Using override text: {verse_text} — {reference_text}")
     else:
         row_number, verse_text, reference_text = fetch_next_verse(sheets_service)
         if not verse_text:
             print("No unused verses found in the sheet. Exiting.")
             sys.exit(0)
-        print(f"Selected verse (row {row_number}): {verse_text} â€” {reference_text}")
+        print(f"Selected verse (row {row_number}): {verse_text} — {reference_text}")
 
     video_path = build_video(verse_text, reference_text)
 
@@ -339,3 +346,99 @@ def main():
 if __name__ == "__main__":
     main()
 
+'@
+Set-Content -Path "scripts\generate_video.py" -Value $pyContent -Encoding utf8
+
+Write-Host "Writing updated .github/workflows/generate-video.yml..."
+$ymlContent = @'
+name: Generate and Upload Verse Video
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC — fully automatic run: random theme/music, reads Sheet, uploads private
+  workflow_dispatch:
+    inputs:
+      privacy:
+        description: "Who can see the uploaded video"
+        required: true
+        type: choice
+        options:
+          - private
+          - unlisted
+          - public
+        default: private
+      background_theme:
+        description: "Background gradient style"
+        required: true
+        type: choice
+        options:
+          - Random
+          - Midnight Purple
+          - Ocean Blue
+          - Wine Red
+          - Emerald Teal
+          - Sunset Amber
+          - Indigo Violet
+          - Deep Teal
+          - Magenta Plum
+        default: Random
+      music_choice:
+        description: "Which music track to use"
+        required: true
+        type: choice
+        options:
+          - Random
+          - track1.mp3
+          - track2.mp3
+        default: Random
+      verse_override:
+        description: "Optional: type a verse here to test with, instead of pulling from the Sheet"
+        required: false
+        type: string
+      reference_override:
+        description: "Optional: reference to go with the verse_override above (e.g. John 3:16)"
+        required: false
+        type: string
+
+jobs:
+  generate-video:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-noto-core
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run video generation and upload
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
+          BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
+          MUSIC_CHOICE: ${{ inputs.music_choice || 'Random' }}
+          VERSE_OVERRIDE: ${{ inputs.verse_override || '' }}
+          REFERENCE_OVERRIDE: ${{ inputs.reference_override || '' }}
+        run: python scripts/generate_video.py
+
+'@
+Set-Content -Path ".github\workflows\generate-video.yml" -Value $ymlContent -Encoding utf8
+
+Write-Host "Committing and pushing to GitHub..."
+git add .
+git commit -m "Word-by-word reveal, cinematic text, manual controls, hashtags, public option"
+git push
+
+Write-Host "Done! Go to the Actions tab on GitHub to run the workflow."

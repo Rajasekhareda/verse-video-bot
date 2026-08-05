@@ -1,9 +1,51 @@
-name: Generate and Upload Verse Video
+﻿name: Generate and Upload Verse Video
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # daily at 06:00 UTC — change to your preferred time
-  workflow_dispatch: {}    # lets you trigger it manually from the Actions tab
+    - cron: "0 6 * * *"   # daily at 06:00 UTC â€” fully automatic run: random theme/music, reads Sheet, uploads private
+  workflow_dispatch:
+    inputs:
+      privacy:
+        description: "Who can see the uploaded video"
+        required: true
+        type: choice
+        options:
+          - private
+          - unlisted
+          - public
+        default: private
+      background_theme:
+        description: "Background gradient style"
+        required: true
+        type: choice
+        options:
+          - Random
+          - Midnight Purple
+          - Ocean Blue
+          - Wine Red
+          - Emerald Teal
+          - Sunset Amber
+          - Indigo Violet
+          - Deep Teal
+          - Magenta Plum
+        default: Random
+      music_choice:
+        description: "Which music track to use"
+        required: true
+        type: choice
+        options:
+          - Random
+          - track1.mp3
+          - track2.mp3
+        default: Random
+      verse_override:
+        description: "Optional: type a verse here to test with, instead of pulling from the Sheet"
+        required: false
+        type: string
+      reference_override:
+        description: "Optional: reference to go with the verse_override above (e.g. John 3:16)"
+        required: false
+        type: string
 
 jobs:
   generate-video:
@@ -31,4 +73,10 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
+          BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
+          MUSIC_CHOICE: ${{ inputs.music_choice || 'Random' }}
+          VERSE_OVERRIDE: ${{ inputs.verse_override || '' }}
+          REFERENCE_OVERRIDE: ${{ inputs.reference_override || '' }}
         run: python scripts/generate_video.py
+
