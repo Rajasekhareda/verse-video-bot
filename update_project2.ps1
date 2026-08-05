@@ -42,6 +42,7 @@ SECONDS_PER_WORD = 0.35      # word-by-word reveal speed (lower = faster)
 MAX_REVEAL_SECONDS = 14      # cap so very long verses don't drag on forever
 VIDEO_SIZE = (1280, 720)
 STROKE_WIDTH = 3             # outline thickness for the cinematic "engraved" text look
+TEXT_MARGIN_X = 130          # keeps text well clear of the edges (~2cm inset look)
 
 OUTPUT_DIR = "output"
 
@@ -76,6 +77,36 @@ ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
 def is_telugu(text):
     """True if the text contains Telugu-script characters (Unicode range 0C00–0C7F)."""
     return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
+
+
+def draw_sparkle(draw, x, y, size, color):
+    """A small four-point sparkle/star mark."""
+    draw.line([x - size, y, x + size, y], fill=color, width=2)
+    draw.line([x, y - size, x, y + size], fill=color, width=2)
+    draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=color)
+
+
+def add_sparkle_border(img):
+    """Adds an elegant gold rounded border with sparkle accents around the
+    frame edge — computed once per video, not per-frame, so it stays fast."""
+    draw = ImageDraw.Draw(img)
+    w, h = img.size
+    margin = 34
+    gold = (255, 215, 0)
+
+    draw.rounded_rectangle(
+        [margin, margin, w - margin, h - margin], radius=24, outline=gold, width=3
+    )
+
+    sparkle_spots = [
+        (margin, margin), (w - margin, margin),
+        (margin, h - margin), (w - margin, h - margin),
+        (w // 2, margin), (w // 2, h - margin),
+    ]
+    for (sx, sy) in sparkle_spots:
+        draw_sparkle(draw, sx, sy, 10, (255, 255, 255))
+
+    return img
 
 
 def make_gradient_background(size):
@@ -221,7 +252,7 @@ def render_frame(background, verse_text, reference_text, words_to_show, show_ref
 
     words = verse_text.split()
     visible_text = " ".join(words[:words_to_show])
-    max_width = size[0] - 160
+    max_width = size[0] - (TEXT_MARGIN_X * 2)
     lines = wrap_text(draw, visible_text, verse_font, max_width)
 
     line_height = VERSE_FONT_SIZE + 16
@@ -231,14 +262,14 @@ def render_frame(background, verse_text, reference_text, words_to_show, show_ref
     for line in lines:
         bbox = draw.textbbox((0, 0), line, font=verse_font)
         w = bbox[2] - bbox[0]
-        x = (size[0] - w) // 2
+        x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
         draw_cinematic_text(draw, line, verse_font, x, y)
         y += line_height
 
     if show_reference and reference_text:
         bbox = draw.textbbox((0, 0), reference_text, font=ref_font)
         w = bbox[2] - bbox[0]
-        x = (size[0] - w) // 2
+        x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
         y_ref = y + 30
         draw.text((x + 3, y_ref + 3), reference_text, font=ref_font, fill=(0, 0, 0))
         draw.text((x, y_ref), reference_text, font=ref_font, fill=(255, 215, 0), stroke_width=2, stroke_fill=(60, 40, 0))
@@ -250,6 +281,7 @@ def build_video(verse_text, reference_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     background = make_gradient_background(VIDEO_SIZE)
+    background = add_sparkle_border(background)
     size = VIDEO_SIZE
 
     verse_font_path = FONT_PATH_TELUGU if is_telugu(verse_text) else FONT_PATH_LATIN
@@ -349,96 +381,9 @@ if __name__ == "__main__":
 '@
 Set-Content -Path "scripts\generate_video.py" -Value $pyContent -Encoding utf8
 
-Write-Host "Writing updated .github/workflows/generate-video.yml..."
-$ymlContent = @'
-name: Generate and Upload Verse Video
-
-on:
-  schedule:
-    - cron: "0 6 * * *"   # daily at 06:00 UTC — fully automatic run: random theme/music, reads Sheet, uploads private
-  workflow_dispatch:
-    inputs:
-      privacy:
-        description: "Who can see the uploaded video"
-        required: true
-        type: choice
-        options:
-          - private
-          - unlisted
-          - public
-        default: private
-      background_theme:
-        description: "Background gradient style"
-        required: true
-        type: choice
-        options:
-          - Random
-          - Midnight Purple
-          - Ocean Blue
-          - Wine Red
-          - Emerald Teal
-          - Sunset Amber
-          - Indigo Violet
-          - Deep Teal
-          - Magenta Plum
-        default: Random
-      music_choice:
-        description: "Which music track to use"
-        required: true
-        type: choice
-        options:
-          - Random
-          - track1.mp3
-          - track2.mp3
-        default: Random
-      verse_override:
-        description: "Optional: type a verse here to test with, instead of pulling from the Sheet"
-        required: false
-        type: string
-      reference_override:
-        description: "Optional: reference to go with the verse_override above (e.g. John 3:16)"
-        required: false
-        type: string
-
-jobs:
-  generate-video:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install ffmpeg and fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-noto-core
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run video generation and upload
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
-          BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
-          MUSIC_CHOICE: ${{ inputs.music_choice || 'Random' }}
-          VERSE_OVERRIDE: ${{ inputs.verse_override || '' }}
-          REFERENCE_OVERRIDE: ${{ inputs.reference_override || '' }}
-        run: python scripts/generate_video.py
-
-'@
-Set-Content -Path ".github\workflows\generate-video.yml" -Value $ymlContent -Encoding utf8
-
 Write-Host "Committing and pushing to GitHub..."
 git add .
-git commit -m "Word-by-word reveal, cinematic text, manual controls, hashtags, public option"
+git commit -m "Fix text margins, add sparkle border"
 git push
 
 Write-Host "Done! Go to the Actions tab on GitHub to run the workflow."
