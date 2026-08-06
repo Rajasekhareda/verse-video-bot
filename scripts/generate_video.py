@@ -1,6 +1,8 @@
 ﻿import os
 import sys
+import math
 import random
+import colorsys
 import unicodedata
 
 import numpy as np
@@ -29,13 +31,29 @@ FONT_PATH_LATIN = os.environ.get(
 VIDEO_DURATION = 45          # seconds, fixed length (extra room to add your own voiceover later)
 MUSIC_START_OFFSET = 10      # start music 10s into the track
 FPS = 24
-VERSE_FONT_SIZE = 78         # bumped up for a bigger, bolder look
-REF_FONT_SIZE = 52
+VIDEO_SIZE = (1280, 720)
+
+# Telugu glyphs render visibly taller than Latin ones at the same point size,
+# so each script gets its own size to look visually consistent.
+VERSE_FONT_SIZE_LATIN = 78
+VERSE_FONT_SIZE_TELUGU = 58
+REF_FONT_SIZE_LATIN = 52
+REF_FONT_SIZE_TELUGU = 38
+
+STROKE_WIDTH = 3             # outline thickness for the cinematic "engraved" text look
 SECONDS_PER_WORD = 0.35      # word-by-word reveal speed (lower = faster)
 MAX_REVEAL_SECONDS = 14      # cap so very long verses don't drag on forever
-VIDEO_SIZE = (1280, 720)
-STROKE_WIDTH = 3             # outline thickness for the cinematic "engraved" text look
-TEXT_MARGIN_X = 130          # keeps text well clear of the edges (~2cm inset look)
+TEXT_MARGIN_X = 130          # keeps text well clear of the edges
+
+# Neon border: positioned ~0.5cm inside the canvas edge (~19px at typical screen density)
+NEON_BORDER_MARGIN = 19
+NEON_BORDER_THICKNESS = 4
+NEON_GLOW_THICKNESS = 11
+NEON_CYCLE_SPEED = 0.12       # how fast the rainbow colors shift/move (higher = faster)
+NEON_SEGMENTS_PER_SIDE = 14   # smoothness of the color flow along each edge
+
+# Twinkling stars, placed just outside the neon border
+STARS_PER_SIDE = 5
 
 OUTPUT_DIR = "output"
 
@@ -48,8 +66,6 @@ VERSE_OVERRIDE = os.environ.get("VERSE_OVERRIDE", "").strip()
 REFERENCE_OVERRIDE = os.environ.get("REFERENCE_OVERRIDE", "").strip()
 # -----------------------------------------
 
-# A handful of eye-catching, hand-picked gradient color pairs, each with a name
-# so they can be picked by name from the manual "Run workflow" screen.
 GRADIENT_PALETTES = {
     "Midnight Purple": ((15, 12, 45), (90, 30, 110)),
     "Ocean Blue": ((10, 25, 55), (30, 90, 130)),
@@ -61,7 +77,6 @@ GRADIENT_PALETTES = {
     "Magenta Plum": ((35, 10, 45), (120, 30, 100)),
 }
 
-# Hashtags always included, plus ones chosen based on verse language.
 BASE_HASHTAGS = ["#BibleVerse", "#DailyVerse", "#Faith", "#God", "#Jesus", "#Scripture"]
 TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#Telugu"]
 ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
@@ -72,34 +87,89 @@ def is_telugu(text):
     return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
 
 
-def draw_sparkle(draw, x, y, size, color):
-    """A small four-point sparkle/star mark."""
+def hue_to_rgb(hue):
+    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, 1.0, 1.0)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def dim(color, factor):
+    return tuple(int(c * factor) for c in color)
+
+
+def build_border_points(w, h, margin):
+    """Perimeter points (clockwise from top-left) used to draw the neon border
+    as a series of short colored segments, so colors can flow along it."""
+    points = []
+    steps = NEON_SEGMENTS_PER_SIDE
+    x0, y0, x1, y1 = margin, margin, w - margin, h - margin
+
+    for i in range(steps + 1):  # top edge, left -> right
+        points.append((x0 + (x1 - x0) * i / steps, y0))
+    for i in range(1, steps + 1):  # right edge, top -> bottom
+        points.append((x1, y0 + (y1 - y0) * i / steps))
+    for i in range(1, steps + 1):  # bottom edge, right -> left
+        points.append((x1 - (x1 - x0) * i / steps, y1))
+    for i in range(1, steps + 1):  # left edge, bottom -> top
+        points.append((x0, y1 - (y1 - y0) * i / steps))
+
+    return points
+
+
+def draw_neon_border(draw, size, t):
+    """Draws a glowing rainbow border whose colors flow around the edge over time."""
+    w, h = size
+    points = build_border_points(w, h, NEON_BORDER_MARGIN)
+    n = len(points) - 1
+    time_offset = t * NEON_CYCLE_SPEED
+
+    for i in range(n):
+        p1, p2 = points[i], points[i + 1]
+        hue = (i / n) + time_offset
+        color = hue_to_rgb(hue)
+        # glow pass (soft, thicker, dimmer) then bright core pass on top
+        draw.line([p1, p2], fill=dim(color, 0.45), width=NEON_GLOW_THICKNESS)
+        draw.line([p1, p2], fill=color, width=NEON_BORDER_THICKNESS)
+
+
+def make_star_positions(size):
+    """Fixed star positions just outside the neon border, evenly spaced,
+    at least STARS_PER_SIDE per side. Each gets a random twinkle phase/speed."""
+    w, h = size
+    outer = NEON_BORDER_MARGIN - 10  # sits between the true edge and the border
+    outer = max(outer, 6)
+    stars = []
+
+    def add_row(x_vals, y_vals):
+        for x, y in zip(x_vals, y_vals):
+            stars.append({
+                "x": x, "y": y,
+                "phase": random.uniform(0, math.tau),
+                "speed": random.uniform(1.2, 2.4),
+            })
+
+    xs_top = np.linspace(40, w - 40, STARS_PER_SIDE)
+    add_row(xs_top, [outer] * STARS_PER_SIDE)
+    add_row(xs_top, [h - outer] * STARS_PER_SIDE)
+
+    ys_side = np.linspace(40, h - 40, STARS_PER_SIDE)
+    add_row([outer] * STARS_PER_SIDE, ys_side)
+    add_row([w - outer] * STARS_PER_SIDE, ys_side)
+
+    return stars
+
+
+def draw_star_mark(draw, x, y, size, color):
     draw.line([x - size, y, x + size, y], fill=color, width=2)
     draw.line([x, y - size, x, y + size], fill=color, width=2)
-    draw.ellipse([x - 3, y - 3, x + 3, y + 3], fill=color)
+    draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=color)
 
 
-def add_sparkle_border(img):
-    """Adds an elegant gold rounded border with sparkle accents around the
-    frame edge â€” computed once per video, not per-frame, so it stays fast."""
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
-    margin = 34
-    gold = (255, 215, 0)
-
-    draw.rounded_rectangle(
-        [margin, margin, w - margin, h - margin], radius=24, outline=gold, width=3
-    )
-
-    sparkle_spots = [
-        (margin, margin), (w - margin, margin),
-        (margin, h - margin), (w - margin, h - margin),
-        (w // 2, margin), (w // 2, h - margin),
-    ]
-    for (sx, sy) in sparkle_spots:
-        draw_sparkle(draw, sx, sy, 10, (255, 255, 255))
-
-    return img
+def draw_twinkling_stars(draw, stars, t):
+    for s in stars:
+        brightness = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(s["speed"] * t + s["phase"]))
+        size = 5 + 5 * brightness
+        shade = int(255 * brightness)
+        draw_star_mark(draw, s["x"], s["y"], size, (shade, shade, shade))
 
 
 def make_gradient_background(size):
@@ -138,7 +208,6 @@ def pick_music_file():
         for f in music_files:
             if f.lower() == MUSIC_CHOICE.lower():
                 return os.path.join(MUSIC_DIR, f)
-        # requested file not found â€” fall back to random rather than crash
         print(f"Warning: '{MUSIC_CHOICE}' not found in {MUSIC_DIR}, picking randomly instead.")
 
     return os.path.join(MUSIC_DIR, random.choice(music_files))
@@ -157,12 +226,10 @@ def generate_hashtags(reference_text, verse_text):
         if book_tag != "#" and book_tag not in tags:
             tags.append(book_tag)
 
-    return tags[:10]  # keep it reasonable, avoid hashtag spam
+    return tags[:10]
 
 
 def get_user_credentials():
-    """Single OAuth credential (your own Google account) used for both
-    Sheets and YouTube â€” avoids needing a service account entirely."""
     return UserCredentials(
         None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
@@ -185,7 +252,6 @@ def get_youtube_service(creds):
 
 
 def fetch_next_verse(service):
-    """Column A = verse text, B = reference, C = 'used' marker (written by this script)."""
     range_ = f"{SHEET_TAB}!A2:C"
     result = (
         service.spreadsheets()
@@ -199,7 +265,7 @@ def fetch_next_verse(service):
         reference = row[1] if len(row) > 1 else ""
         used = row[2] if len(row) > 2 else ""
         if verse and used.strip().lower() != "used":
-            row_number = i + 2  # +2: header row + 0-index offset
+            row_number = i + 2
             return row_number, verse.strip(), reference.strip()
     return None, None, None
 
@@ -213,13 +279,19 @@ def mark_verse_used(service, row_number):
     ).execute()
 
 
+def text_width(draw, text, font):
+    """Width of text INCLUDING the stroke outline, so wrapping/centering
+    never lets the visible (stroked) text run past the margin."""
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=STROKE_WIDTH)
+    return bbox[2] - bbox[0]
+
+
 def wrap_text(draw, text, font, max_width):
     words = text.split()
     lines, current = [], ""
     for word in words:
         test = f"{current} {word}".strip()
-        bbox = draw.textbbox((0, 0), test, font=font)
-        if bbox[2] - bbox[0] <= max_width:
+        if text_width(draw, test, font) <= max_width:
             current = test
         else:
             if current:
@@ -231,37 +303,35 @@ def wrap_text(draw, text, font, max_width):
 
 
 def draw_cinematic_text(draw, text, font, x, y):
-    """Draws text with an offset drop-shadow plus a stroke outline for a
-    bold, engraved 'cinematic' depth look."""
     draw.text((x + 4, y + 4), text, font=font, fill=(0, 0, 0))
     draw.text((x, y), text, font=font, fill=(255, 255, 255), stroke_width=STROKE_WIDTH, stroke_fill=(10, 10, 20))
 
 
-def render_frame(background, verse_text, reference_text, words_to_show, show_reference, size, verse_font_path, ref_font_path):
+def render_frame(background, verse_text, reference_text, words_to_show, show_reference,
+                  size, verse_font, ref_font, t, stars):
     img = background.copy()
     draw = ImageDraw.Draw(img)
-    verse_font = ImageFont.truetype(verse_font_path, VERSE_FONT_SIZE)
-    ref_font = ImageFont.truetype(ref_font_path, REF_FONT_SIZE)
+
+    draw_neon_border(draw, size, t)
+    draw_twinkling_stars(draw, stars, t)
 
     words = verse_text.split()
     visible_text = " ".join(words[:words_to_show])
     max_width = size[0] - (TEXT_MARGIN_X * 2)
     lines = wrap_text(draw, visible_text, verse_font, max_width)
 
-    line_height = VERSE_FONT_SIZE + 16
+    line_height = verse_font.size + 16
     total_height = len(lines) * line_height
     y = (size[1] - total_height) // 2 - 40
 
     for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=verse_font)
-        w = bbox[2] - bbox[0]
+        w = text_width(draw, line, verse_font)
         x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
         draw_cinematic_text(draw, line, verse_font, x, y)
         y += line_height
 
     if show_reference and reference_text:
-        bbox = draw.textbbox((0, 0), reference_text, font=ref_font)
-        w = bbox[2] - bbox[0]
+        w = text_width(draw, reference_text, ref_font)
         x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
         y_ref = y + 30
         draw.text((x + 3, y_ref + 3), reference_text, font=ref_font, fill=(0, 0, 0))
@@ -274,11 +344,19 @@ def build_video(verse_text, reference_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     background = make_gradient_background(VIDEO_SIZE)
-    background = add_sparkle_border(background)
     size = VIDEO_SIZE
+    stars = make_star_positions(size)
 
-    verse_font_path = FONT_PATH_TELUGU if is_telugu(verse_text) else FONT_PATH_LATIN
-    ref_font_path = FONT_PATH_TELUGU if is_telugu(reference_text) else FONT_PATH_LATIN
+    verse_is_telugu = is_telugu(verse_text)
+    ref_is_telugu = is_telugu(reference_text)
+
+    verse_font_path = FONT_PATH_TELUGU if verse_is_telugu else FONT_PATH_LATIN
+    ref_font_path = FONT_PATH_TELUGU if ref_is_telugu else FONT_PATH_LATIN
+    verse_font_size = VERSE_FONT_SIZE_TELUGU if verse_is_telugu else VERSE_FONT_SIZE_LATIN
+    ref_font_size = REF_FONT_SIZE_TELUGU if ref_is_telugu else REF_FONT_SIZE_LATIN
+
+    verse_font = ImageFont.truetype(verse_font_path, verse_font_size)
+    ref_font = ImageFont.truetype(ref_font_path, ref_font_size)
 
     words = verse_text.split()
     n_words = len(words)
@@ -296,7 +374,8 @@ def build_video(verse_text, reference_text):
             words_to_show = n_words
             show_reference = True
         frames.append(
-            render_frame(background, verse_text, reference_text, words_to_show, show_reference, size, verse_font_path, ref_font_path)
+            render_frame(background, verse_text, reference_text, words_to_show, show_reference,
+                         size, verse_font, ref_font, t, stars)
         )
 
     clip = ImageSequenceClip(frames, fps=FPS)
