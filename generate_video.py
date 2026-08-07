@@ -1,12 +1,3 @@
-# HOW TO USE:
-# 1. Save this file directly INSIDE your verse-video-bot project folder
-#    (the same folder that has "scripts", "assets", ".github" in it).
-# 2. Open PowerShell in that folder, run this first (once per new window):
-#      Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-# 3. Then run:  .\update_project4.ps1
-
-Write-Host "Writing updated scripts/generate_video.py..."
-$pyContent = @'
 import os
 import sys
 import math
@@ -373,19 +364,21 @@ def draw_cinematic_text(draw, text, font, x, y):
 
 
 def fit_verse_font(draw, full_text, font_path, initial_size, min_size, max_width, max_height):
-    """Shrinks the verse font (in 2pt steps) until the FULL verse text wraps
-    into a block that fits the available height. Computed once from the full
-    text, so the size stays constant through the word-by-word reveal."""
+    """Shrinks the verse font until the FULL verse text wraps into a block
+    that fits the available height. Computed once from the full text, so the
+    size stays constant through the word-by-word reveal. Uses proportional
+    line spacing so smaller sizes also get tighter spacing (more lines fit)."""
     size = initial_size
-    while size >= min_size:
+    absolute_floor = 16  # never go below this — a hard safety net for extremely long verses
+    while size >= absolute_floor:
         font = ImageFont.truetype(font_path, size)
         lines = wrap_text(draw, full_text, font, max_width)
-        line_height = size + 16
+        line_height = int(size * 1.3)
         total_height = len(lines) * line_height
         if total_height <= max_height:
             return font
         size -= 2
-    return ImageFont.truetype(font_path, min_size)
+    return ImageFont.truetype(font_path, absolute_floor)
 
 
 def render_frame(background, verse_text, reference_text, words_to_show, show_reference,
@@ -401,7 +394,7 @@ def render_frame(background, verse_text, reference_text, words_to_show, show_ref
     max_width = size[0] - (TEXT_MARGIN_X * 2)
     lines = wrap_text(draw, visible_text, verse_font, max_width)
 
-    line_height = verse_font.size + 16
+    line_height = int(verse_font.size * 1.3)
     total_height = len(lines) * line_height
     y = (size[1] - total_height) // 2 - 40
 
@@ -543,101 +536,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-'@
-Set-Content -Path "scripts\generate_video.py" -Value $pyContent -Encoding utf8
-
-Write-Host "Writing updated .github/workflows/generate-video.yml..."
-$ymlContent = @'
-name: Generate and Upload Verse Video
-
-on:
-  schedule:
-    - cron: "0 6 * * *"   # daily at 06:00 UTC — fully automatic run: random theme/music, reads Sheet, uploads private
-  workflow_dispatch:
-    inputs:
-      privacy:
-        description: "Who can see the uploaded video"
-        required: true
-        type: choice
-        options:
-          - private
-          - unlisted
-          - public
-        default: private
-      background_theme:
-        description: "Background style — pick 'Custom Image' to use your own uploaded photo"
-        required: true
-        type: choice
-        options:
-          - Random
-          - Custom Image
-          - Midnight Purple
-          - Ocean Blue
-          - Wine Red
-          - Emerald Teal
-          - Sunset Amber
-          - Indigo Violet
-          - Deep Teal
-          - Magenta Plum
-        default: Random
-      music_choice:
-        description: "Which music track to use"
-        required: true
-        type: choice
-        options:
-          - Random
-          - track1.mp3
-          - track2.mp3
-        default: Random
-      verse_override:
-        description: "Optional: type a verse here to test with, instead of pulling from the Sheet"
-        required: false
-        type: string
-      reference_override:
-        description: "Optional: reference to go with the verse_override above (e.g. John 3:16)"
-        required: false
-        type: string
-
-jobs:
-  generate-video:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install ffmpeg and fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-noto-core
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run video generation and upload
-        env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
-          BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
-          MUSIC_CHOICE: ${{ inputs.music_choice || 'Random' }}
-          VERSE_OVERRIDE: ${{ inputs.verse_override || '' }}
-          REFERENCE_OVERRIDE: ${{ inputs.reference_override || '' }}
-        run: python scripts/generate_video.py
-
-'@
-Set-Content -Path ".github\workflows\generate-video.yml" -Value $ymlContent -Encoding utf8
-
-Write-Host "Committing and pushing to GitHub..."
-git add .
-git commit -m "Auto-fit text sizing (fixes long-verse cutoff), custom background image support"
-git push
-
-Write-Host "Done! Go to the Actions tab on GitHub to run the workflow."
