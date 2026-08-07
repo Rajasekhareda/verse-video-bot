@@ -1,7 +1,9 @@
 # HOW TO USE:
 # 1. Save this file directly INSIDE your verse-video-bot project folder
 #    (the same folder that has "scripts", "assets", ".github" in it).
-# 2. Open PowerShell in that folder and run:  .\update_project3.ps1
+# 2. Open PowerShell in that folder, run this first (once per new window):
+#      Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+# 3. Then run:  .\update_project4.ps1
 
 Write-Host "Writing updated scripts/generate_video.py..."
 $pyContent = @'
@@ -25,6 +27,7 @@ SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
 
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
+CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
 
 # Two fonts: Telugu script needs its own font, English uses DejaVu.
 # Detected independently for the verse and the reference — no manual choice needed.
@@ -44,8 +47,14 @@ VIDEO_SIZE = (1280, 720)
 # so each script gets its own size to look visually consistent.
 VERSE_FONT_SIZE_LATIN = 78
 VERSE_FONT_SIZE_TELUGU = 58
+VERSE_FONT_MIN_LATIN = 34    # verse text auto-shrinks down to this size if needed so long verses always fit on screen
+VERSE_FONT_MIN_TELUGU = 26
 REF_FONT_SIZE_LATIN = 52
 REF_FONT_SIZE_TELUGU = 38
+
+# Vertical space kept clear at the very top/bottom of the frame (border + breathing room)
+SAFE_TOP = 110
+SAFE_BOTTOM = 110
 
 STROKE_WIDTH = 3             # outline thickness for the cinematic "engraved" text look
 SECONDS_PER_WORD = 0.35      # word-by-word reveal speed (lower = faster)
@@ -179,6 +188,41 @@ def draw_twinkling_stars(draw, stars, t):
         draw_star_mark(draw, s["x"], s["y"], size, (shade, shade, shade))
 
 
+def find_custom_background():
+    """Looks for an uploaded custom background at assets/backgrounds/custom_background.*
+    Upload it directly on GitHub's website — no local file editing needed."""
+    if not os.path.isdir(CUSTOM_BG_DIR):
+        return None
+    for ext in (".jpg", ".jpeg", ".png"):
+        path = os.path.join(CUSTOM_BG_DIR, "custom_background" + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def load_custom_background(path, size):
+    """Cover-fit crop: fills the whole frame without distorting the image."""
+    img = Image.open(path).convert("RGB")
+    target_w, target_h = size
+    src_w, src_h = img.size
+    scale = max(target_w / src_w, target_h / src_h)
+    new_w, new_h = int(src_w * scale), int(src_h * scale)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    img = img.crop((left, top, left + target_w, top + target_h))
+
+    # same soft vignette used on gradients, so text stays readable on any photo
+    w, h = size
+    vignette = Image.new("L", size, 0)
+    vdraw = ImageDraw.Draw(vignette)
+    vdraw.ellipse([-w * 0.3, -h * 0.3, w * 1.3, h * 1.3], fill=255)
+    vignette = vignette.filter(ImageFilter.GaussianBlur(120))
+    dark = Image.new("RGB", size, (0, 0, 0))
+    img = Image.composite(img, dark, vignette)
+    return img
+
+
 def make_gradient_background(size):
     """Generates a diagonal gradient with a soft vignette. Picks a random themed
     palette unless a specific theme name was requested for a manual run."""
@@ -204,6 +248,20 @@ def make_gradient_background(size):
     img = Image.composite(img, dark, vignette)
 
     return img
+
+
+def make_background(size):
+    """Uses your uploaded custom image if the theme requests it and one exists;
+    otherwise generates a gradient (random or a named palette)."""
+    wants_custom = BACKGROUND_THEME.lower() in ("custom", "custom image", "my custom image", "my uploaded image")
+    if wants_custom:
+        custom_path = find_custom_background()
+        if custom_path:
+            print(f"Using custom background: {custom_path}")
+            return load_custom_background(custom_path, size)
+        print("Custom background requested but none found — falling back to gradient.")
+
+    return make_gradient_background(size)
 
 
 def pick_music_file():
@@ -314,6 +372,22 @@ def draw_cinematic_text(draw, text, font, x, y):
     draw.text((x, y), text, font=font, fill=(255, 255, 255), stroke_width=STROKE_WIDTH, stroke_fill=(10, 10, 20))
 
 
+def fit_verse_font(draw, full_text, font_path, initial_size, min_size, max_width, max_height):
+    """Shrinks the verse font (in 2pt steps) until the FULL verse text wraps
+    into a block that fits the available height. Computed once from the full
+    text, so the size stays constant through the word-by-word reveal."""
+    size = initial_size
+    while size >= min_size:
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_text(draw, full_text, font, max_width)
+        line_height = size + 16
+        total_height = len(lines) * line_height
+        if total_height <= max_height:
+            return font
+        size -= 2
+    return ImageFont.truetype(font_path, min_size)
+
+
 def render_frame(background, verse_text, reference_text, words_to_show, show_reference,
                   size, verse_font, ref_font, t, stars):
     img = background.copy()
@@ -350,7 +424,7 @@ def render_frame(background, verse_text, reference_text, words_to_show, show_ref
 def build_video(verse_text, reference_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    background = make_gradient_background(VIDEO_SIZE)
+    background = make_background(VIDEO_SIZE)
     size = VIDEO_SIZE
     stars = make_star_positions(size)
 
@@ -360,10 +434,23 @@ def build_video(verse_text, reference_text):
     verse_font_path = FONT_PATH_TELUGU if verse_is_telugu else FONT_PATH_LATIN
     ref_font_path = FONT_PATH_TELUGU if ref_is_telugu else FONT_PATH_LATIN
     verse_font_size = VERSE_FONT_SIZE_TELUGU if verse_is_telugu else VERSE_FONT_SIZE_LATIN
+    verse_font_min = VERSE_FONT_MIN_TELUGU if verse_is_telugu else VERSE_FONT_MIN_LATIN
     ref_font_size = REF_FONT_SIZE_TELUGU if ref_is_telugu else REF_FONT_SIZE_LATIN
 
-    verse_font = ImageFont.truetype(verse_font_path, verse_font_size)
     ref_font = ImageFont.truetype(ref_font_path, ref_font_size)
+
+    # Reserve vertical room for the reference line, then auto-shrink the verse
+    # font (if needed) so the FULL verse always fits on screen — no more cutoff.
+    max_width = size[0] - (TEXT_MARGIN_X * 2)
+    reference_block_height = (ref_font_size + 30 + 20) if reference_text else 0
+    max_verse_height = size[1] - SAFE_TOP - SAFE_BOTTOM - reference_block_height
+
+    probe_img = Image.new("RGB", size)
+    probe_draw = ImageDraw.Draw(probe_img)
+    verse_font = fit_verse_font(
+        probe_draw, verse_text, verse_font_path, verse_font_size, verse_font_min,
+        max_width, max_verse_height
+    )
 
     words = verse_text.split()
     n_words = len(words)
@@ -460,9 +547,97 @@ if __name__ == "__main__":
 '@
 Set-Content -Path "scripts\generate_video.py" -Value $pyContent -Encoding utf8
 
+Write-Host "Writing updated .github/workflows/generate-video.yml..."
+$ymlContent = @'
+name: Generate and Upload Verse Video
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC — fully automatic run: random theme/music, reads Sheet, uploads private
+  workflow_dispatch:
+    inputs:
+      privacy:
+        description: "Who can see the uploaded video"
+        required: true
+        type: choice
+        options:
+          - private
+          - unlisted
+          - public
+        default: private
+      background_theme:
+        description: "Background style — pick 'Custom Image' to use your own uploaded photo"
+        required: true
+        type: choice
+        options:
+          - Random
+          - Custom Image
+          - Midnight Purple
+          - Ocean Blue
+          - Wine Red
+          - Emerald Teal
+          - Sunset Amber
+          - Indigo Violet
+          - Deep Teal
+          - Magenta Plum
+        default: Random
+      music_choice:
+        description: "Which music track to use"
+        required: true
+        type: choice
+        options:
+          - Random
+          - track1.mp3
+          - track2.mp3
+        default: Random
+      verse_override:
+        description: "Optional: type a verse here to test with, instead of pulling from the Sheet"
+        required: false
+        type: string
+      reference_override:
+        description: "Optional: reference to go with the verse_override above (e.g. John 3:16)"
+        required: false
+        type: string
+
+jobs:
+  generate-video:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-noto-core
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run video generation and upload
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
+          BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
+          MUSIC_CHOICE: ${{ inputs.music_choice || 'Random' }}
+          VERSE_OVERRIDE: ${{ inputs.verse_override || '' }}
+          REFERENCE_OVERRIDE: ${{ inputs.reference_override || '' }}
+        run: python scripts/generate_video.py
+
+'@
+Set-Content -Path ".github\workflows\generate-video.yml" -Value $ymlContent -Encoding utf8
+
 Write-Host "Committing and pushing to GitHub..."
 git add .
-git commit -m "Neon animated border, twinkling stars, fixed font sizing and text overflow"
+git commit -m "Auto-fit text sizing (fixes long-verse cutoff), custom background image support"
 git push
 
 Write-Host "Done! Go to the Actions tab on GitHub to run the workflow."
