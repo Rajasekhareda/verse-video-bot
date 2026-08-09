@@ -8,7 +8,7 @@ import unicodedata
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from moviepy.editor import ImageSequenceClip, AudioFileClip
+from moviepy.editor import VideoClip, AudioFileClip
 
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
@@ -31,32 +31,58 @@ CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
 FONT_PATH_TELUGU = os.environ.get(
     "FONT_PATH_TELUGU", "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
 )
-FONT_PATH_LATIN = os.environ.get(
-    "FONT_PATH_LATIN", "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
-)
+
+# English text (Columns B and C) now uses Poppins instead of Noto Serif.
+# Poppins isn't a default system font, so it needs to actually be present —
+# download "Poppins-Bold.ttf" from Google Fonts and place it in your repo at
+# assets/fonts/Poppins-Bold.ttf (or point FONT_PATH_LATIN at wherever you put
+# it). If the file isn't found, this safely falls back to Noto Serif instead
+# of crashing the whole run.
+_FONT_PATH_LATIN_REQUESTED = os.environ.get("FONT_PATH_LATIN", "assets/fonts/Poppins-Bold.ttf")
+_FONT_PATH_LATIN_FALLBACK = "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
+if os.path.exists(_FONT_PATH_LATIN_REQUESTED):
+    FONT_PATH_LATIN = _FONT_PATH_LATIN_REQUESTED
+else:
+    print(f"Warning: font not found at '{_FONT_PATH_LATIN_REQUESTED}', falling back to Noto Serif.")
+    FONT_PATH_LATIN = _FONT_PATH_LATIN_FALLBACK
 
 VIDEO_DURATION = 45
 MUSIC_START_OFFSET = 10
 FPS = 24
-VIDEO_SIZE = (1280, 720)
+VIDEO_SIZE = (3840, 2160)   # 4K UHD
+
+# Every pixel-based constant below was tuned for a 1280x720 reference frame.
+# RENDER_SCALE keeps borders, margins, stroke widths, and star sizes visually
+# identical in proportion when the output resolution changes (e.g. to 4K).
+RENDER_SCALE = VIDEO_SIZE[0] / 1280
 
 # Telugu glyphs render visibly taller than Latin ones at the same point size.
-MAIN_FONT_SIZE_LATIN = 72
-MAIN_FONT_SIZE_TELUGU = 54
-NOTE_FONT_SIZE_LATIN = 44
-NOTE_FONT_SIZE_TELUGU = 34
+# Column C (the note/explanation) now renders at the same size as Column A/B —
+# there is no longer a separate, smaller note font.
+MAIN_FONT_SIZE_LATIN = int(72 * RENDER_SCALE)
+MAIN_FONT_SIZE_TELUGU = int(54 * RENDER_SCALE)
 
-STROKE_WIDTH = 3
+STROKE_WIDTH = int(3 * RENDER_SCALE)
+OUTLAY_STROKE_WIDTH = int(9 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
+SHADOW_OFFSET = int(4 * RENDER_SCALE)
+
+# A manual line break placed by hand in the sheet — either as a real newline
+# (Alt+Enter / Option+Return inside the cell) or as literal typed text "\n"
+# (backslash + n) — always forces a new line at that exact spot, before any
+# automatic width-based wrapping happens.
+LINE_GAP_PT = 2                 # fixed vertical gap between lines
+PT_TO_PX = 96 / 72               # standard 1pt = 1/72in at 96dpi, for on-screen video text
+
 SECONDS_PER_WORD = 0.35
 MAX_REVEAL_SECONDS = 12
-TEXT_MARGIN_X = 130
-SAFE_TOP = 110
-SAFE_BOTTOM = 110
+TEXT_MARGIN_X = int(130 * RENDER_SCALE)
+SAFE_TOP = int(110 * RENDER_SCALE)
+SAFE_BOTTOM = int(110 * RENDER_SCALE)
 TRANSITION_SECONDS = 1.3   # how long each scroll-out/scroll-in transition takes
 
-NEON_BORDER_MARGIN = 19
-NEON_BORDER_THICKNESS = 4
-NEON_GLOW_THICKNESS = 11
+NEON_BORDER_MARGIN = int(19 * RENDER_SCALE)
+NEON_BORDER_THICKNESS = int(4 * RENDER_SCALE)
+NEON_GLOW_THICKNESS = int(11 * RENDER_SCALE)
 NEON_CYCLE_SPEED = 0.12
 NEON_SEGMENTS_PER_SIDE = 14
 
@@ -168,31 +194,32 @@ def draw_neon_border(draw, size, t):
 def make_star_positions(size):
     w, h = size
     outer = max(NEON_BORDER_MARGIN - 10, 6)
+    edge_margin = int(40 * RENDER_SCALE)
     stars = []
 
     def add_row(x_vals, y_vals):
         for x, y in zip(x_vals, y_vals):
             stars.append({"x": x, "y": y, "phase": random.uniform(0, math.tau), "speed": random.uniform(1.2, 2.4)})
 
-    xs_top = np.linspace(40, w - 40, STARS_PER_SIDE)
+    xs_top = np.linspace(edge_margin, w - edge_margin, STARS_PER_SIDE)
     add_row(xs_top, [outer] * STARS_PER_SIDE)
     add_row(xs_top, [h - outer] * STARS_PER_SIDE)
-    ys_side = np.linspace(40, h - 40, STARS_PER_SIDE)
+    ys_side = np.linspace(edge_margin, h - edge_margin, STARS_PER_SIDE)
     add_row([outer] * STARS_PER_SIDE, ys_side)
     add_row([w - outer] * STARS_PER_SIDE, ys_side)
     return stars
 
 
 def draw_star_mark(draw, x, y, size, color):
-    draw.line([x - size, y, x + size, y], fill=color, width=2)
-    draw.line([x, y - size, x, y + size], fill=color, width=2)
+    draw.line([x - size, y, x + size, y], fill=color, width=max(2, int(2 * RENDER_SCALE)))
+    draw.line([x, y - size, x, y + size], fill=color, width=max(2, int(2 * RENDER_SCALE)))
     draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=color)
 
 
 def draw_twinkling_stars(draw, stars, t):
     for s in stars:
         brightness = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(s["speed"] * t + s["phase"]))
-        size = 5 + 5 * brightness
+        size = (5 + 5 * brightness) * RENDER_SCALE
         shade = int(255 * brightness)
         draw_star_mark(draw, s["x"], s["y"], size, (shade, shade, shade))
 
@@ -214,7 +241,7 @@ def apply_vignette(img, size):
     vignette = Image.new("L", size, 0)
     vdraw = ImageDraw.Draw(vignette)
     vdraw.ellipse([-w * 0.3, -h * 0.3, w * 1.3, h * 1.3], fill=255)
-    vignette = vignette.filter(ImageFilter.GaussianBlur(120))
+    vignette = vignette.filter(ImageFilter.GaussianBlur(int(120 * RENDER_SCALE)))
     dark = Image.new("RGB", size, (0, 0, 0))
     return Image.composite(img, dark, vignette)
 
@@ -327,80 +354,159 @@ def text_width(draw, text, font):
     return bbox[2] - bbox[0]
 
 
+def normalize_manual_breaks(text):
+    """A break placed by hand in the sheet may arrive in several forms
+    depending on how it was typed or pasted:
+    - a real newline (Alt+Enter / Option+Return in the cell)
+    - literal "\n" typed as two characters (backslash + n)
+    - literal "\\n" — an extra escaped backslash, common when text is
+      copy-pasted from a source that already escapes backslashes
+    - a Windows-style "\r\n", or a stray lone "\r"
+    All of these are normalized to a single real newline so downstream
+    code only ever has to handle one case."""
+    if text is None:
+        return text
+    text = text.replace("\\\\n", "\n")   # escaped backslash + n  -> break (handle first)
+    text = text.replace("\\n", "\n")      # plain backslash + n    -> break
+    text = text.replace("\r\n", "\n")     # Windows real newline   -> break
+    text = text.replace("\r", "\n")       # stray carriage return  -> break
+    return text
+
+
 def wrap_text(draw, text, font, max_width):
-    words = text.split()
-    lines, current = [], ""
-    for word in words:
-        test = f"{current} {word}".strip()
-        if text_width(draw, test, font) <= max_width:
-            current = test
-        else:
-            if current:
-                lines.append(current)
-            current = word
-    if current:
-        lines.append(current)
+    """Wraps text to max_width. Any manual break ("\n") in the text always
+    starts a new line first — each segment between manual breaks is then
+    auto-wrapped independently by pixel width, so a break you place in the
+    sheet is never overridden by the automatic wrapping."""
+    text = normalize_manual_breaks(text)
+    lines = []
+    for segment in text.split("\n"):
+        words = segment.split()
+        current = ""
+        for word in words:
+            test = f"{current} {word}".strip()
+            if text_width(draw, test, font) <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        lines.append(current)  # keep even if blank, to preserve an intentional blank line
     return lines
 
 
-def fit_text_block(draw, full_text, font_path, initial_size, max_width, max_height):
+def compute_line_height(font):
+    """Real line height: the font's own ascent+descent, plus a fixed 2pt
+    gap — not a multiplier of font size, so the gap stays exactly 2pt
+    (scaled for the render resolution) regardless of how much the font
+    has been shrunk to fit."""
+    ascent, descent = font.getmetrics()
+    gap_px = LINE_GAP_PT * PT_TO_PX * RENDER_SCALE
+    return int(round(ascent + descent + gap_px))
+
+
+def fit_text_block(draw, full_text, font_path, initial_size, max_width, max_height, min_size=None):
     """Shrinks font until the full text wraps into a block that fits the
-    available height. Absolute floor of 16pt — always fits, no matter how long."""
+    available height. Floor defaults to a resolution-scaled 16pt, but a
+    phase can pass a higher min_size (e.g. Column C's note text) so long
+    text doesn't shrink far more than the main verse just because it has
+    more words. If it still doesn't fit at the floor, it renders at the
+    floor anyway (slight overflow) rather than shrinking further."""
     size = initial_size
-    absolute_floor = 16
+    absolute_floor = min_size if min_size is not None else max(16, int(16 * RENDER_SCALE))
     while size >= absolute_floor:
         font = ImageFont.truetype(font_path, size)
         lines = wrap_text(draw, full_text, font, max_width)
-        line_height = int(size * 1.3)
+        line_height = compute_line_height(font)
         if len(lines) * line_height <= max_height:
             return font, lines, line_height
         size -= 2
     font = ImageFont.truetype(font_path, absolute_floor)
     lines = wrap_text(draw, full_text, font, max_width)
-    return font, lines, int(absolute_floor * 1.3)
+    return font, lines, compute_line_height(font)
 
 
-def draw_cinematic_text(draw, text, font, x, y, fill, stroke_fill):
-    draw.text((x + 4, y + 4), text, font=font, fill=(0, 0, 0))
-    draw.text((x, y), text, font=font, fill=fill, stroke_width=STROKE_WIDTH, stroke_fill=stroke_fill)
+def make_vertical_gradient(size, color_top, color_bottom):
+    w, h = size
+    top = np.array(color_top, dtype=float)
+    bottom = np.array(color_bottom, dtype=float)
+    t = np.linspace(0, 1, h).reshape(h, 1, 1)
+    grad = (top * (1 - t) + bottom * t).astype(np.uint8)
+    grad = np.repeat(grad, w, axis=1)
+    return Image.fromarray(grad, mode="RGB")
 
 
-def draw_text_block(draw, lines, font, line_height, size, y_offset, fill, stroke_fill):
+def draw_cinematic_text(img, draw, text, font, x, y, fill_top, fill_bottom, outlay_fill, inner_edge):
+    """Cinematic text: drop shadow -> thick solid "outlay" border -> a
+    vertical-gradient "inlay" fill clipped to the glyph shapes -> a thin
+    crisp inner edge on top for definition."""
+    # drop shadow
+    draw.text((x + SHADOW_OFFSET, y + SHADOW_OFFSET), text, font=font, fill=(0, 0, 0))
+
+    # outlay: thick solid border, drawn wide so it peeks out from behind the fill
+    draw.text((x, y), text, font=font, fill=outlay_fill,
+               stroke_width=OUTLAY_STROKE_WIDTH, stroke_fill=outlay_fill)
+
+    # thin crisp inner edge, sitting between the outlay border and the gradient fill
+    draw.text((x, y), text, font=font, fill=inner_edge,
+               stroke_width=max(1, STROKE_WIDTH // 3), stroke_fill=inner_edge)
+
+    # inlay: gradient fill on top, clipped to the exact glyph shapes via a mask
+    # (the mask has no stroke, so the thin inner_edge ring stays visible around it)
+    mask_img = Image.new("L", img.size, 0)
+    mask_draw = ImageDraw.Draw(mask_img)
+    mask_draw.text((x, y), text, font=font, fill=255)
+    gradient = make_vertical_gradient(img.size, fill_top, fill_bottom)
+    img.paste(gradient, (0, 0), mask_img)
+
+
+def draw_text_block(img, draw, lines, font, line_height, size, y_offset, colors):
+    fill_top, fill_bottom, outlay_fill, inner_edge = colors
     total_height = len(lines) * line_height
     y = (size[1] - total_height) // 2 - 40 + y_offset
     for line in lines:
         w = text_width(draw, line, font)
         x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
-        draw_cinematic_text(draw, line, font, x, y, fill, stroke_fill)
+        draw_cinematic_text(img, draw, line, font, x, y, fill_top, fill_bottom, outlay_fill, inner_edge)
         y += line_height
 
 
 # ---------------- scene / phase building ----------------
 
 def build_phase(text, style, size):
-    """Prepares one phase: picks font/size/color by script + style, and fits
+    """Prepares one phase: picks font/size/colors by script + style, and fits
     the full text to the whole available frame (each phase gets the screen
     to itself, so nothing ever fights another block for space)."""
     telugu = is_telugu(text)
     font_path = FONT_PATH_TELUGU if telugu else FONT_PATH_LATIN
+    initial_size = MAIN_FONT_SIZE_TELUGU if telugu else MAIN_FONT_SIZE_LATIN
 
     if style == "main":
-        initial_size = MAIN_FONT_SIZE_TELUGU if telugu else MAIN_FONT_SIZE_LATIN
-        fill, stroke_fill = (255, 255, 255), (10, 10, 20)
-    else:  # "note" — the optional explanation, styled a little differently
-        initial_size = NOTE_FONT_SIZE_TELUGU if telugu else NOTE_FONT_SIZE_LATIN
-        fill, stroke_fill = (255, 215, 0), (60, 40, 0)
+        # Inlay: warm gold-white vertical gradient (unchanged). Outlay: pure green.
+        colors = ((255, 240, 190), (255, 255, 255), (0, 255, 0), (0, 90, 20))
+    else:  # "note" — the optional explanation, same size as main, distinct palette
+        # Inlay: amber-gold vertical gradient (unchanged). Outlay: pure green.
+        colors = ((255, 224, 130), (255, 175, 60), (0, 255, 0), (0, 90, 20))
 
     max_width = size[0] - (TEXT_MARGIN_X * 2)
     max_height = size[1] - SAFE_TOP - SAFE_BOTTOM
 
+    # Note text (Column C) is usually longer than the verse, so it would
+    # otherwise auto-shrink much smaller than Column A/B just to fit. Give it
+    # a much higher floor — 80% of its starting size — so it stays visually
+    # close in size; if it truly can't fit at that floor it will slightly
+    # overflow rather than keep shrinking.
+    min_size = int(initial_size * 0.8) if style == "note" else None
+
     probe_img = Image.new("RGB", size)
     probe_draw = ImageDraw.Draw(probe_img)
-    font, lines, line_height = fit_text_block(probe_draw, text, font_path, initial_size, max_width, max_height)
+    font, lines, line_height = fit_text_block(
+        probe_draw, text, font_path, initial_size, max_width, max_height, min_size=min_size
+    )
 
     return {
         "text": text, "font": font, "lines": lines, "line_height": line_height,
-        "fill": fill, "stroke_fill": stroke_fill,
+        "colors": colors,
     }
 
 
@@ -426,11 +532,11 @@ def render_video_frame(background, size, phases, t, stars):
         ease = progress * progress * (3 - 2 * progress)  # smoothstep
 
         out_offset = -ease * (size[1])
-        draw_text_block(draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["fill"], phase["stroke_fill"])
+        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["colors"])
 
         next_phase = phases[idx + 1]
         in_offset = (1 - ease) * size[1]
-        draw_text_block(draw, next_phase["lines"], next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["fill"], next_phase["stroke_fill"])
+        draw_text_block(img, draw, next_phase["lines"], next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"])
 
     elif idx == 0 and tl < reveal_duration:
         words = phase["text"].split()
@@ -439,10 +545,10 @@ def render_video_frame(background, size, phases, t, stars):
         visible_text = " ".join(words[:words_to_show])
         max_width = size[0] - (TEXT_MARGIN_X * 2)
         lines = wrap_text(draw, visible_text, phase["font"], max_width)
-        draw_text_block(draw, lines, phase["font"], phase["line_height"], size, 0, phase["fill"], phase["stroke_fill"])
+        draw_text_block(img, draw, lines, phase["font"], phase["line_height"], size, 0, phase["colors"])
 
     else:
-        draw_text_block(draw, phase["lines"], phase["font"], phase["line_height"], size, 0, phase["fill"], phase["stroke_fill"])
+        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, 0, phase["colors"])
 
     return np.array(img.convert("RGB"))
 
@@ -475,17 +581,27 @@ def build_video(telugu_text, english_text, explanation_text):
     phase_duration = VIDEO_DURATION / len(phases)
     phases[0]["reveal_duration"] = min(n_words_first * SECONDS_PER_WORD, MAX_REVEAL_SECONDS, phase_duration * 0.6)
 
-    total_frames = VIDEO_DURATION * FPS
-    frames = [render_video_frame(background, size, phases, f / FPS, stars) for f in range(total_frames)]
+    # Frames are rendered on demand by moviepy (one at a time) rather than all
+    # built into a Python list up front. At 4K, holding every frame in memory
+    # simultaneously would need ~25GB+ of RAM for a 45s clip — this streams
+    # instead, so memory use stays flat regardless of resolution or duration.
+    def make_frame(t):
+        return render_video_frame(background, size, phases, t, stars)
 
-    clip = ImageSequenceClip(frames, fps=FPS)
+    clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
 
     chosen_music = pick_music_file()
     audio = AudioFileClip(chosen_music).subclip(MUSIC_START_OFFSET, MUSIC_START_OFFSET + VIDEO_DURATION)
     clip = clip.set_audio(audio)
 
     output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
-    clip.write_videofile(output_path, fps=FPS, codec="libx264", audio_codec="aac")
+    # 4K needs a much higher bitrate than 720p to actually look sharp —
+    # libx264 defaults would otherwise compress it down to mushy quality.
+    clip.write_videofile(
+        output_path, fps=FPS, codec="libx264", audio_codec="aac",
+        bitrate="40M", preset="medium",
+        ffmpeg_params=["-pix_fmt", "yuv420p"],
+    )
     return output_path
 
 
