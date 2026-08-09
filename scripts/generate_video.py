@@ -62,8 +62,8 @@ RENDER_SCALE = VIDEO_SIZE[0] / 1280
 MAIN_FONT_SIZE_LATIN = int(72 * RENDER_SCALE)
 MAIN_FONT_SIZE_TELUGU = int(54 * RENDER_SCALE)
 
-STROKE_WIDTH = int(3 * RENDER_SCALE)
-OUTLAY_STROKE_WIDTH = int(9 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
+STROKE_WIDTH = int(2 * RENDER_SCALE)
+OUTLAY_STROKE_WIDTH = int(3 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
 SHADOW_OFFSET = int(4 * RENDER_SCALE)
 
 # A manual line break placed by hand in the sheet — either as a real newline
