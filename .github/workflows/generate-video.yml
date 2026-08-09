@@ -1,25 +1,23 @@
-﻿name: Generate and Upload Verse Video
+name: Generate and Upload Verse Video
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # daily at 06:00 UTC â€” fully automatic run: random theme/music, reads Sheet, uploads private
+    - cron: "0 6 * * *"   # daily at 06:00 UTC — fully automatic run
   workflow_dispatch:
     inputs:
       privacy:
         description: "Who can see the uploaded video"
         required: true
         type: choice
-        options:
-          - private
-          - unlisted
-          - public
+        options: [private, unlisted, public]
         default: private
       background_theme:
-        description: "Background gradient style"
+        description: "Background style — pick 'Custom Image' to use your own uploaded photo"
         required: true
         type: choice
         options:
           - Random
+          - Custom Image
           - Midnight Purple
           - Ocean Blue
           - Wine Red
@@ -33,17 +31,24 @@ on:
         description: "Which music track to use"
         required: true
         type: choice
-        options:
-          - Random
-          - track1.mp3
-          - track2.mp3
+        options: [Random, track1.mp3, track2.mp3]
         default: Random
-      verse_override:
-        description: "Optional: type a verse here to test with, instead of pulling from the Sheet"
+      include_explanation:
+        description: "Include the explanation phase (column C in the Sheet)?"
+        required: true
+        type: choice
+        options: [Auto, Yes, No]
+        default: Auto
+      telugu_override:
+        description: "Optional: test with this Telugu text instead of the Sheet"
         required: false
         type: string
-      reference_override:
-        description: "Optional: reference to go with the verse_override above (e.g. John 3:16)"
+      english_override:
+        description: "Optional: test with this English text instead of the Sheet"
+        required: false
+        type: string
+      explanation_override:
+        description: "Optional: test explanation text (used only with the overrides above)"
         required: false
         type: string
 
@@ -76,7 +81,8 @@ jobs:
           PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
           BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
           MUSIC_CHOICE: ${{ inputs.music_choice || 'Random' }}
-          VERSE_OVERRIDE: ${{ inputs.verse_override || '' }}
-          REFERENCE_OVERRIDE: ${{ inputs.reference_override || '' }}
+          INCLUDE_EXPLANATION: ${{ inputs.include_explanation || 'Auto' }}
+          TELUGU_OVERRIDE: ${{ inputs.telugu_override || '' }}
+          ENGLISH_OVERRIDE: ${{ inputs.english_override || '' }}
+          EXPLANATION_OVERRIDE: ${{ inputs.explanation_override || '' }}
         run: python scripts/generate_video.py
-
