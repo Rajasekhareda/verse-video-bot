@@ -62,15 +62,15 @@ RENDER_SCALE = VIDEO_SIZE[0] / 1280
 MAIN_FONT_SIZE_LATIN = int(72 * RENDER_SCALE)
 MAIN_FONT_SIZE_TELUGU = int(54 * RENDER_SCALE)
 
-STROKE_WIDTH = int(2 * RENDER_SCALE)
-OUTLAY_STROKE_WIDTH = int(3 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
+STROKE_WIDTH = int(3 * RENDER_SCALE)
+OUTLAY_STROKE_WIDTH = int(9 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
 SHADOW_OFFSET = int(4 * RENDER_SCALE)
 
 # A manual line break placed by hand in the sheet — either as a real newline
 # (Alt+Enter / Option+Return inside the cell) or as literal typed text "\n"
 # (backslash + n) — always forces a new line at that exact spot, before any
 # automatic width-based wrapping happens.
-LINE_GAP_PT = 2                 # fixed vertical gap between lines
+LINE_GAP_PT = 1.5               # fixed vertical gap between lines
 PT_TO_PX = 96 / 72               # standard 1pt = 1/72in at 96dpi, for on-screen video text
 
 SECONDS_PER_WORD = 0.35
@@ -79,6 +79,17 @@ TEXT_MARGIN_X = int(130 * RENDER_SCALE)
 SAFE_TOP = int(110 * RENDER_SCALE)
 SAFE_BOTTOM = int(110 * RENDER_SCALE)
 TRANSITION_SECONDS = 1.3   # how long each scroll-out/scroll-in transition takes
+
+# Column-specific timing. If a column is missing (e.g. no explanation), the
+# remaining columns' durations are scaled up proportionally so the video
+# always totals exactly VIDEO_DURATION.
+COLUMN_DURATIONS = {"A": 15, "B": 12, "C": 18}
+
+# Column C often has many lines. Rather than shrinking the font tiny to cram
+# them all in at once, it's split into readable groups shown one at a time
+# within its own time budget, at roughly this many seconds per group.
+NOTE_SECONDS_PER_PAGE = 5
+NOTE_PAGE_CROSSFADE_SECONDS = 0.5
 
 NEON_BORDER_MARGIN = int(19 * RENDER_SCALE)
 NEON_BORDER_THICKNESS = int(4 * RENDER_SCALE)
@@ -473,7 +484,7 @@ def draw_text_block(img, draw, lines, font, line_height, size, y_offset, colors)
 
 # ---------------- scene / phase building ----------------
 
-def build_phase(text, style, size):
+def build_phase(text, style, size, column):
     """Prepares one phase: picks font/size/colors by script + style, and fits
     the full text to the whole available frame (each phase gets the screen
     to itself, so nothing ever fights another block for space)."""
@@ -482,11 +493,15 @@ def build_phase(text, style, size):
     initial_size = MAIN_FONT_SIZE_TELUGU if telugu else MAIN_FONT_SIZE_LATIN
 
     if style == "main":
-        # Inlay: warm gold-white vertical gradient (unchanged). Outlay: pure green.
-        colors = ((255, 240, 190), (255, 255, 255), (0, 255, 0), (0, 90, 20))
+        # Inlay: soft ivory fading to rich gold. Outlay: deep espresso-bronze
+        # (replaces the previous green outline) for a premium, cinematic,
+        # engraved-plaque look that reads clearly on any background.
+        colors = ((255, 248, 225), (255, 209, 112), (25, 15, 8), (128, 82, 24))
     else:  # "note" — the optional explanation, same size as main, distinct palette
-        # Inlay: amber-gold vertical gradient (unchanged). Outlay: pure green.
-        colors = ((255, 224, 130), (255, 175, 60), (0, 255, 0), (0, 90, 20))
+        # Inlay: warm amber-gold, slightly deeper than the main text so the
+        # two remain easy to tell apart. Same espresso-bronze outlay for
+        # visual consistency across the whole video.
+        colors = ((255, 233, 186), (224, 160, 64), (25, 15, 8), (107, 66, 18))
 
     max_width = size[0] - (TEXT_MARGIN_X * 2)
     max_height = size[1] - SAFE_TOP - SAFE_BOTTOM
@@ -506,7 +521,7 @@ def build_phase(text, style, size):
 
     return {
         "text": text, "font": font, "lines": lines, "line_height": line_height,
-        "colors": colors,
+        "colors": colors, "column": column,
     }
 
 
@@ -518,9 +533,18 @@ def render_video_frame(background, size, phases, t, stars):
     draw_twinkling_stars(draw, stars, t)
 
     num_phases = len(phases)
-    phase_duration = VIDEO_DURATION / num_phases
-    idx = min(int(t // phase_duration), num_phases - 1)
-    tl = t - idx * phase_duration
+
+    # Each phase has its own fixed duration (Column A/B/C timing) rather than
+    # an equal split — find which phase "t" currently falls into.
+    idx = 0
+    elapsed = 0.0
+    for i, ph in enumerate(phases):
+        if t < elapsed + ph["duration"] or i == num_phases - 1:
+            idx = i
+            break
+        elapsed += ph["duration"]
+    phase_duration = phases[idx]["duration"]
+    tl = t - elapsed
     phase = phases[idx]
 
     in_transition = tl >= (phase_duration - TRANSITION_SECONDS) and idx < num_phases - 1
@@ -535,8 +559,11 @@ def render_video_frame(background, size, phases, t, stars):
         draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["colors"])
 
         next_phase = phases[idx + 1]
+        # If the incoming phase is paged (Column C), scroll in showing its
+        # first page/group only — not the entire unwrapped block.
+        next_lines = next_phase["pages"][0] if "pages" in next_phase else next_phase["lines"]
         in_offset = (1 - ease) * size[1]
-        draw_text_block(img, draw, next_phase["lines"], next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"])
+        draw_text_block(img, draw, next_lines, next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"])
 
     elif idx == 0 and tl < reveal_duration:
         words = phase["text"].split()
@@ -546,6 +573,28 @@ def render_video_frame(background, size, phases, t, stars):
         max_width = size[0] - (TEXT_MARGIN_X * 2)
         lines = wrap_text(draw, visible_text, phase["font"], max_width)
         draw_text_block(img, draw, lines, phase["font"], phase["line_height"], size, 0, phase["colors"])
+
+    elif "pages" in phase:
+        # Column C: cycle through its grouped lines sequentially within its
+        # own time budget, with a short crossfade between groups.
+        pages = phase["pages"]
+        page_duration = phase["page_duration"]
+        num_pages = len(pages)
+        page_idx = min(int(tl // page_duration), num_pages - 1)
+        local = tl - page_idx * page_duration
+        crossfade = min(NOTE_PAGE_CROSSFADE_SECONDS, page_duration * 0.3)
+
+        if page_idx > 0 and local < crossfade:
+            alpha = local / crossfade if crossfade > 0 else 1.0
+            prev_img = img.copy()
+            prev_draw = ImageDraw.Draw(prev_img)
+            draw_text_block(prev_img, prev_draw, pages[page_idx - 1], phase["font"], phase["line_height"], size, 0, phase["colors"])
+            curr_img = img.copy()
+            curr_draw = ImageDraw.Draw(curr_img)
+            draw_text_block(curr_img, curr_draw, pages[page_idx], phase["font"], phase["line_height"], size, 0, phase["colors"])
+            img = Image.blend(prev_img, curr_img, alpha)
+        else:
+            draw_text_block(img, draw, pages[page_idx], phase["font"], phase["line_height"], size, 0, phase["colors"])
 
     else:
         draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, 0, phase["colors"])
@@ -562,24 +611,45 @@ def build_video(telugu_text, english_text, explanation_text):
 
     phase_specs = []
     if telugu_text:
-        phase_specs.append((telugu_text, "main"))
+        phase_specs.append((telugu_text, "main", "A"))
     if english_text:
-        phase_specs.append((english_text, "main"))
+        phase_specs.append((english_text, "main", "B"))
 
     include_explanation = bool(explanation_text) and INCLUDE_EXPLANATION != "no"
     if INCLUDE_EXPLANATION == "yes" and not explanation_text:
         include_explanation = False
     if include_explanation:
-        phase_specs.append((explanation_text, "note"))
+        phase_specs.append((explanation_text, "note", "C"))
 
     if not phase_specs:
         raise ValueError("No text to render — Telugu and English are both empty.")
 
-    phases = [build_phase(text, style, size) for text, style in phase_specs]
+    phases = [build_phase(text, style, size, column) for text, style, column in phase_specs]
+
+    # Fixed per-column durations (A=15s, B=12s, C=18s). If a column is
+    # missing, the remaining columns are scaled up proportionally so the
+    # video always totals exactly VIDEO_DURATION.
+    intended_total = sum(COLUMN_DURATIONS[p["column"]] for p in phases)
+    scale = VIDEO_DURATION / intended_total if intended_total > 0 else 1
+    for p in phases:
+        p["duration"] = COLUMN_DURATIONS[p["column"]] * scale
 
     n_words_first = len(phases[0]["text"].split())
-    phase_duration = VIDEO_DURATION / len(phases)
-    phases[0]["reveal_duration"] = min(n_words_first * SECONDS_PER_WORD, MAX_REVEAL_SECONDS, phase_duration * 0.6)
+    phases[0]["reveal_duration"] = min(n_words_first * SECONDS_PER_WORD, MAX_REVEAL_SECONDS, phases[0]["duration"] * 0.6)
+
+    # Column C (the note/explanation) often has many lines. Rather than
+    # cramming them all into one shrunken block, group them into readable
+    # "pages" shown sequentially within Column C's own time budget.
+    for p in phases:
+        if p["column"] != "C":
+            continue
+        total_lines = len(p["lines"])
+        target_pages = max(1, round(p["duration"] / NOTE_SECONDS_PER_PAGE))
+        num_pages = max(1, min(target_pages, total_lines))
+        lines_per_page = math.ceil(total_lines / num_pages) if total_lines else 1
+        pages = [p["lines"][i:i + lines_per_page] for i in range(0, total_lines, lines_per_page)] or [[]]
+        p["pages"] = pages
+        p["page_duration"] = p["duration"] / len(pages)
 
     # Frames are rendered on demand by moviepy (one at a time) rather than all
     # built into a Python list up front. At 4K, holding every frame in memory
