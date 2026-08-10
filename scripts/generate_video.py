@@ -662,14 +662,27 @@ def build_video(telugu_text, english_text, explanation_text):
     # Column C (the note/explanation) often has many lines. Rather than
     # cramming them all into one shrunken block, group them into readable
     # "pages" shown sequentially within Column C's own time budget.
+    # Each page is screen-fitted independently so it never overflows.
     for p in phases:
         if p["column"] != "C":
             continue
-        total_lines = len(p["lines"])
+        font = p["font"]
+        line_height = p["line_height"]
+        max_height = size[1] - SAFE_TOP - SAFE_BOTTOM
+
+        # How many lines fit on screen at once for this font size?
+        lines_per_screen = max(1, int(max_height // line_height))
+
+        all_lines = p["lines"]
+        total_lines = len(all_lines)
+
+        # Target page count from timing budget, but never exceed what the
+        # screen can fit per page or go under 1 line per page.
         target_pages = max(1, round(p["duration"] / NOTE_SECONDS_PER_PAGE))
         num_pages = max(1, min(target_pages, total_lines))
-        lines_per_page = math.ceil(total_lines / num_pages) if total_lines else 1
-        pages = [p["lines"][i:i + lines_per_page] for i in range(0, total_lines, lines_per_page)] or [[]]
+        lines_per_page = min(lines_per_screen, math.ceil(total_lines / num_pages))
+
+        pages = [all_lines[i:i + lines_per_page] for i in range(0, total_lines, lines_per_page)] or [[]]
         p["pages"] = pages
         p["page_duration"] = p["duration"] / len(pages)
 
