@@ -17,757 +17,556 @@ from googleapiclient.http import MediaFileUpload
 # ================= SHEET LAYOUT =================
 # Column A = Telugu verse text
 # Column B = English verse text
-# Column C = optional brief explanation/note (English or Telugu) — leave blank if none
+# Column C = optional explanation (English or Telugu) — leave blank if none
 # Column D = "used" marker, written automatically by this script
 # ==================================================
 
-SHEET_ID = os.environ["SHEET_ID"]
-SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
-
-MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
+SHEET_ID    = os.environ["SHEET_ID"]
+SHEET_TAB   = os.environ.get("SHEET_TAB", "Sheet1")
+MUSIC_DIR   = os.environ.get("MUSIC_DIR",   "assets/music")
 CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
 
-# Cinematic serif fonts — Telugu script needs its own font file.
-FONT_PATH_TELUGU = os.environ.get(
-    "FONT_PATH_TELUGU", "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
-)
+# --------------- FONTS ---------------
+# Telugu always uses NotoSerifTelugu (system-installed by the workflow).
+# English uses NotoSerif (also system-installed) — clean, elegant, cinematic.
+# Poppins is not used; it caused boxes because it is not installed by default.
+FONT_PATH_TELUGU = "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
+FONT_PATH_ENGLISH = "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
 
-# English text (Columns B and C) now uses Poppins instead of Noto Serif.
-# Poppins isn't a default system font, so it needs to actually be present —
-# download "Poppins-Bold.ttf" from Google Fonts and place it in your repo at
-# assets/fonts/Poppins-Bold.ttf (or point FONT_PATH_LATIN at wherever you put
-# it). If the file isn't found, this safely falls back to Noto Serif instead
-# of crashing the whole run.
-_FONT_PATH_LATIN_REQUESTED = os.environ.get("FONT_PATH_LATIN", "assets/fonts/Poppins-Bold.ttf")
-_FONT_PATH_LATIN_FALLBACK = "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
-if os.path.exists(_FONT_PATH_LATIN_REQUESTED):
-    FONT_PATH_LATIN = _FONT_PATH_LATIN_REQUESTED
-else:
-    print(f"Warning: font not found at '{_FONT_PATH_LATIN_REQUESTED}', falling back to Noto Serif.")
-    FONT_PATH_LATIN = _FONT_PATH_LATIN_FALLBACK
+# --------------- VIDEO ---------------
+VIDEO_SIZE     = (1920, 1080)   # Full-HD (fast render; upscale in YT Studio if needed)
+FPS            = 24
+VIDEO_DURATION = 45             # total seconds
 
-VIDEO_DURATION = 45
-MUSIC_START_OFFSET = 10
-FPS = 24
-VIDEO_SIZE = (3840, 2160)   # 4K UHD
-
-# Every pixel-based constant below was tuned for a 1280x720 reference frame.
-# RENDER_SCALE keeps borders, margins, stroke widths, and star sizes visually
-# identical in proportion when the output resolution changes (e.g. to 4K).
+# RENDER_SCALE keeps every pixel-based measurement proportional to the resolution.
 RENDER_SCALE = VIDEO_SIZE[0] / 1280
 
-# Telugu glyphs render visibly taller than Latin ones at the same point size.
-# Column C (the note/explanation) now renders at the same size as Column A/B —
-# there is no longer a separate, smaller note font.
-MAIN_FONT_SIZE_LATIN = int(72 * RENDER_SCALE)
-MAIN_FONT_SIZE_TELUGU = int(54 * RENDER_SCALE)
-
-STROKE_WIDTH = int(3 * RENDER_SCALE)
-OUTLAY_STROKE_WIDTH = int(9 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
-SHADOW_OFFSET = int(4 * RENDER_SCALE)
-
-# A manual line break placed by hand in the sheet — either as a real newline
-# (Alt+Enter / Option+Return inside the cell) or as literal typed text "\n"
-# (backslash + n) — always forces a new line at that exact spot, before any
-# automatic width-based wrapping happens.
-LINE_GAP_PT = 1.5               # fixed vertical gap between lines
-PT_TO_PX = 96 / 72               # standard 1pt = 1/72in at 96dpi, for on-screen video text
-
-SECONDS_PER_WORD = 0.35
-MAX_REVEAL_SECONDS = 12
-TEXT_MARGIN_X = int(130 * RENDER_SCALE)
-SAFE_TOP = int(110 * RENDER_SCALE)
-SAFE_BOTTOM = int(110 * RENDER_SCALE)
-TRANSITION_SECONDS = 1.3   # how long each scroll-out/scroll-in transition takes
-
-# Column-specific timing. If a column is missing (e.g. no explanation), the
-# remaining columns' durations are scaled up proportionally so the video
-# always totals exactly VIDEO_DURATION.
+# --------------- TIMING ---------------
+# Column A = 15 s, Column B = 12 s, Column C = 18 s.
+# If a column is absent its share is redistributed so total always = VIDEO_DURATION.
 COLUMN_DURATIONS = {"A": 15, "B": 12, "C": 18}
+MUSIC_START_OFFSET = 10
 
-# Column C often has many lines. Rather than shrinking the font tiny to cram
-# them all in at once, it's split into readable groups shown one at a time
-# within its own time budget, at roughly this many seconds per group.
-NOTE_SECONDS_PER_PAGE = 5
-NOTE_PAGE_CROSSFADE_SECONDS = 0.5
+# Line-by-line reveal: each column shows one line at a time, holds 3 s, then
+# crossfades the next line in. Column A word-reveals its first line then switches
+# to line-by-line for subsequent lines.
+LINE_HOLD_SECONDS    = 3.0     # how long each line stays on screen
+LINE_FADE_SECONDS    = 0.4     # crossfade duration between lines
 
-NEON_BORDER_MARGIN = int(19 * RENDER_SCALE)
-NEON_BORDER_THICKNESS = int(4 * RENDER_SCALE)
-NEON_GLOW_THICKNESS = int(11 * RENDER_SCALE)
-NEON_CYCLE_SPEED = 0.12
-NEON_SEGMENTS_PER_SIDE = 14
+# Column C paging (in case a single line is very long — handled by fit_text_block)
+TRANSITION_SECONDS   = 1.0     # scroll transition between columns
 
+# --------------- TEXT LAYOUT ---------------
+TEXT_MARGIN_X  = int(120 * RENDER_SCALE)
+SAFE_TOP       = int(100 * RENDER_SCALE)
+SAFE_BOTTOM    = int(100 * RENDER_SCALE)
+LINE_GAP_PT    = 1.5
+PT_TO_PX       = 96 / 72
+
+# --------------- FONT SIZES ---------------
+FONT_SIZE_A    = int(68 * RENDER_SCALE)   # Column A  (Telugu)
+FONT_SIZE_B    = int(72 * RENDER_SCALE)   # Column B  (English) — slightly bigger
+FONT_SIZE_C    = int(56 * RENDER_SCALE)   # Column C  (explanation, slightly smaller)
+FONT_SIZE_MIN  = int(24 * RENDER_SCALE)   # absolute floor
+
+# --------------- TEXT STYLE ---------------
+# Main verse (A & B): warm ivory → rich gold inlay, deep mahogany outlay
+# Explanation (C):    soft cream → warm amber inlay, dark brown outlay
+COLORS_A = ((255, 248, 220), (255, 200,  80), (60, 25,  5), (180, 110, 30))
+COLORS_B = ((255, 255, 240), (255, 220, 100), (40, 20,  5), (160, 100, 20))
+COLORS_C = ((255, 240, 200), (240, 180,  60), (50, 22,  5), (140,  85, 15))
+
+SHADOW_OFFSET       = int(4 * RENDER_SCALE)
+STROKE_INNER_WIDTH  = max(1, int(2 * RENDER_SCALE))
+STROKE_OUTLAY_WIDTH = max(3, int(8 * RENDER_SCALE))
+
+# --------------- NEON BORDER ---------------
+NEON_MARGIN    = int(18 * RENDER_SCALE)
+NEON_THICK     = int(4  * RENDER_SCALE)
+NEON_GLOW      = int(10 * RENDER_SCALE)
+NEON_SPEED     = 0.10
+NEON_SEGMENTS  = 14
 STARS_PER_SIDE = 5
 
 OUTPUT_DIR = "output"
 
-# Manual-run controls (ignored on the automatic daily schedule).
-PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private").strip().lower()
-MUSIC_CHOICE = os.environ.get("MUSIC_CHOICE", "random").strip()
-BACKGROUND_THEME = os.environ.get("BACKGROUND_THEME", "random").strip()
-INCLUDE_EXPLANATION = os.environ.get("INCLUDE_EXPLANATION", "Auto").strip().lower()  # auto / yes / no
-TELUGU_OVERRIDE = os.environ.get("TELUGU_OVERRIDE", "").strip()
-ENGLISH_OVERRIDE = os.environ.get("ENGLISH_OVERRIDE", "").strip()
+# --------------- RUN CONTROLS (from GitHub Actions inputs) ---------------
+PRIVACY_STATUS       = os.environ.get("PRIVACY_STATUS",       "private").strip().lower()
+MUSIC_CHOICE         = os.environ.get("MUSIC_CHOICE",         "random").strip()
+BACKGROUND_THEME     = os.environ.get("BACKGROUND_THEME",     "random").strip()
+INCLUDE_EXPLANATION  = os.environ.get("INCLUDE_EXPLANATION",  "auto").strip().lower()
+TELUGU_OVERRIDE      = os.environ.get("TELUGU_OVERRIDE",      "").strip()
+ENGLISH_OVERRIDE     = os.environ.get("ENGLISH_OVERRIDE",     "").strip()
 EXPLANATION_OVERRIDE = os.environ.get("EXPLANATION_OVERRIDE", "").strip()
-# ===================================================
 
+# ===================== BACKGROUND PALETTES =====================
 GRADIENT_PALETTES = {
-    "Midnight Purple":  ((18, 12, 52),  (72, 22, 100)),   # deep royal purple
-    "Ocean Blue":       ((8,  30, 70),  (20, 75, 130)),   # deep navy to sapphire
-    "Wine Red":         ((45, 8,  20),  (110, 25, 50)),   # dark burgundy to ruby
-    "Emerald Teal":     ((8,  42, 38),  (18, 100, 82)),   # dark forest to teal
-    "Sunset Amber":     ((50, 22, 8),   (140, 65, 18)),   # dark copper to amber
-    "Indigo Violet":    ((22, 14, 58),  (70, 45, 155)),   # deep indigo to violet
-    "Midnight Slate":   ((14, 20, 38),  (28, 45, 80)),    # near-black to slate blue
-    "Magenta Plum":     ((40, 10, 48),  (110, 22, 95)),   # deep plum to magenta
+    "Midnight Purple": ((14, 10, 42),  (65, 18,  95)),
+    "Ocean Blue":      (( 6, 22, 60),  (16, 65, 120)),
+    "Wine Red":        ((42,  6, 18),  (100, 20,  45)),
+    "Emerald Teal":    (( 6, 38, 34),  (14, 90,  74)),
+    "Sunset Amber":    ((48, 20,  6),  (130, 58,  14)),
+    "Indigo Violet":   ((18, 12, 52),  (62, 40, 140)),
+    "Midnight Slate":  ((12, 18, 34),  (24, 40,  72)),
+    "Magenta Plum":    ((36,  8, 44),  (100, 18,  88)),
 }
 
-BASE_HASHTAGS = ["#BibleVerse", "#DailyVerse", "#Faith", "#God", "#Jesus", "#Scripture"]
-TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#Telugu"]
-ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
+BASE_HASHTAGS    = ["#BibleVerse","#DailyVerse","#Faith","#God","#Jesus","#Scripture"]
+TELUGU_HASHTAGS  = ["#TeluguChristian","#YesuKrishtu","#Telugu"]
+ENGLISH_HASHTAGS = ["#Christian","#Gospel","#WordOfGod"]
 
 
-# ---------------- text/script helpers ----------------
+# ==================== HELPERS ====================
 
 def is_telugu(text):
     return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
 
-
 def extract_reference_tag(text):
-    """Looks for a trailing '(Book Chapter:Verse)' style reference embedded in
-    the verse text itself, used only for hashtags — not displayed separately."""
-    match = re.search(r"\(([^()]+)\)\s*$", text.strip())
-    if not match:
-        return None
-    inner = match.group(1).strip()
-    first_word = inner.split()[0] if inner.split() else None
-    return first_word
-
+    m = re.search(r"\(([^()]+)\)\s*$", (text or "").strip())
+    if not m: return None
+    words = m.group(1).strip().split()
+    return words[0] if words else None
 
 def generate_hashtags(telugu_text, english_text):
     tags = list(BASE_HASHTAGS)
-    tags += TELUGU_HASHTAGS if is_telugu(telugu_text) else []
-    tags += ENGLISH_HASHTAGS if english_text else []
-
-    for source in (english_text, telugu_text):
-        tag_word = extract_reference_tag(source or "")
-        if tag_word:
-            cleaned = "".join(
-                ch for ch in tag_word if not unicodedata.category(ch).startswith(("P", "Z", "C", "N"))
-            )
-            book_tag = "#" + cleaned
-            if book_tag != "#" and book_tag not in tags:
-                tags.append(book_tag)
+    if is_telugu(telugu_text): tags += TELUGU_HASHTAGS
+    if english_text:           tags += ENGLISH_HASHTAGS
+    for src in (english_text, telugu_text):
+        word = extract_reference_tag(src or "")
+        if word:
+            cleaned = "".join(ch for ch in word
+                              if not unicodedata.category(ch).startswith(("P","Z","C","N")))
+            tag = "#" + cleaned
+            if tag != "#" and tag not in tags:
+                tags.append(tag)
             break
-
     return tags[:10]
 
 
-# ---------------- neon border + stars (unchanged visual system) ----------------
+# ==================== NEON BORDER + STARS ====================
 
 def hue_to_rgb(hue):
-    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, 1.0, 1.0)
-    return (int(r * 255), int(g * 255), int(b * 255))
+    r,g,b = colorsys.hsv_to_rgb(hue % 1.0, 1.0, 1.0)
+    return (int(r*255), int(g*255), int(b*255))
 
+def dimmed(color, f):
+    return tuple(int(c*f) for c in color)
 
-def dim(color, factor):
-    return tuple(int(c * factor) for c in color)
-
-
-def build_border_points(w, h, margin):
-    points = []
-    steps = NEON_SEGMENTS_PER_SIDE
-    x0, y0, x1, y1 = margin, margin, w - margin, h - margin
-    for i in range(steps + 1):
-        points.append((x0 + (x1 - x0) * i / steps, y0))
-    for i in range(1, steps + 1):
-        points.append((x1, y0 + (y1 - y0) * i / steps))
-    for i in range(1, steps + 1):
-        points.append((x1 - (x1 - x0) * i / steps, y1))
-    for i in range(1, steps + 1):
-        points.append((x0, y1 - (y1 - y0) * i / steps))
-    return points
-
+def border_points(w, h, m):
+    pts, s = [], NEON_SEGMENTS
+    x0,y0,x1,y1 = m,m,w-m,h-m
+    for i in range(s+1): pts.append((x0+(x1-x0)*i/s, y0))
+    for i in range(1,s+1): pts.append((x1, y0+(y1-y0)*i/s))
+    for i in range(1,s+1): pts.append((x1-(x1-x0)*i/s, y1))
+    for i in range(1,s+1): pts.append((x0, y1-(y1-y0)*i/s))
+    return pts
 
 def draw_neon_border(draw, size, t):
-    w, h = size
-    points = build_border_points(w, h, NEON_BORDER_MARGIN)
-    n = len(points) - 1
-    time_offset = t * NEON_CYCLE_SPEED
+    pts = border_points(*size, NEON_MARGIN)
+    n = len(pts)-1
+    off = t * NEON_SPEED
     for i in range(n):
-        p1, p2 = points[i], points[i + 1]
-        hue = (i / n) + time_offset
-        color = hue_to_rgb(hue)
-        draw.line([p1, p2], fill=dim(color, 0.45), width=NEON_GLOW_THICKNESS)
-        draw.line([p1, p2], fill=color, width=NEON_BORDER_THICKNESS)
+        c = hue_to_rgb((i/n)+off)
+        draw.line([pts[i], pts[i+1]], fill=dimmed(c,0.4), width=NEON_GLOW)
+        draw.line([pts[i], pts[i+1]], fill=c,             width=NEON_THICK)
 
-
-def make_star_positions(size):
-    w, h = size
-    outer = max(NEON_BORDER_MARGIN - 10, 6)
-    edge_margin = int(40 * RENDER_SCALE)
+def make_stars(size):
+    w,h = size
+    outer = max(NEON_MARGIN-10, 6)
+    em    = int(40*RENDER_SCALE)
     stars = []
-
-    def add_row(x_vals, y_vals):
-        for x, y in zip(x_vals, y_vals):
-            stars.append({"x": x, "y": y, "phase": random.uniform(0, math.tau), "speed": random.uniform(1.2, 2.4)})
-
-    xs_top = np.linspace(edge_margin, w - edge_margin, STARS_PER_SIDE)
-    add_row(xs_top, [outer] * STARS_PER_SIDE)
-    add_row(xs_top, [h - outer] * STARS_PER_SIDE)
-    ys_side = np.linspace(edge_margin, h - edge_margin, STARS_PER_SIDE)
-    add_row([outer] * STARS_PER_SIDE, ys_side)
-    add_row([w - outer] * STARS_PER_SIDE, ys_side)
+    def add(xs,ys):
+        for x,y in zip(xs,ys):
+            stars.append({"x":x,"y":y,
+                          "phase":random.uniform(0,math.tau),
+                          "speed":random.uniform(1.2,2.4)})
+    xs = np.linspace(em, w-em, STARS_PER_SIDE)
+    add(xs, [outer]*STARS_PER_SIDE); add(xs, [h-outer]*STARS_PER_SIDE)
+    ys = np.linspace(em, h-em, STARS_PER_SIDE)
+    add([outer]*STARS_PER_SIDE, ys); add([w-outer]*STARS_PER_SIDE, ys)
     return stars
 
-
-def draw_star_mark(draw, x, y, size, color):
-    draw.line([x - size, y, x + size, y], fill=color, width=max(2, int(2 * RENDER_SCALE)))
-    draw.line([x, y - size, x, y + size], fill=color, width=max(2, int(2 * RENDER_SCALE)))
-    draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=color)
-
-
-def draw_twinkling_stars(draw, stars, t):
+def draw_stars(draw, stars, t):
     for s in stars:
-        brightness = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(s["speed"] * t + s["phase"]))
-        size = (5 + 5 * brightness) * RENDER_SCALE
-        shade = int(255 * brightness)
-        draw_star_mark(draw, s["x"], s["y"], size, (shade, shade, shade))
+        b = 0.4+0.6*(0.5+0.5*math.sin(s["speed"]*t+s["phase"]))
+        sz = (4+5*b)*RENDER_SCALE
+        sh = int(255*b)
+        c  = (sh,sh,sh)
+        x,y = s["x"], s["y"]
+        draw.line([x-sz,y,x+sz,y], fill=c, width=max(1,int(2*RENDER_SCALE)))
+        draw.line([x,y-sz,x,y+sz], fill=c, width=max(1,int(2*RENDER_SCALE)))
+        draw.ellipse([x-2,y-2,x+2,y+2], fill=c)
 
 
-# ---------------- background ----------------
-
-def find_custom_background():
-    if not os.path.isdir(CUSTOM_BG_DIR):
-        return None
-    for ext in (".jpg", ".jpeg", ".png"):
-        path = os.path.join(CUSTOM_BG_DIR, "custom_background" + ext)
-        if os.path.exists(path):
-            return path
-    return None
-
+# ==================== BACKGROUND ====================
 
 def apply_vignette(img, size):
-    w, h = size
-    vignette = Image.new("L", size, 0)
-    vdraw = ImageDraw.Draw(vignette)
-    vdraw.ellipse([-w * 0.3, -h * 0.3, w * 1.3, h * 1.3], fill=255)
-    vignette = vignette.filter(ImageFilter.GaussianBlur(int(120 * RENDER_SCALE)))
-    dark = Image.new("RGB", size, (0, 0, 0))
-    return Image.composite(img, dark, vignette)
-
-
-def load_custom_background(path, size):
-    img = Image.open(path).convert("RGB")
-    target_w, target_h = size
-    src_w, src_h = img.size
-    scale = max(target_w / src_w, target_h / src_h)
-    new_w, new_h = int(src_w * scale), int(src_h * scale)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
-    img = img.crop((left, top, left + target_w, top + target_h))
-    return apply_vignette(img, size)
-
-
-def make_gradient_background(size):
-    if BACKGROUND_THEME and BACKGROUND_THEME.lower() != "random" and BACKGROUND_THEME in GRADIENT_PALETTES:
-        top_color, bottom_color = GRADIENT_PALETTES[BACKGROUND_THEME]
-    else:
-        top_color, bottom_color = random.choice(list(GRADIENT_PALETTES.values()))
-
-    w, h = size
-    top = np.array(top_color, dtype=float)
-    bottom = np.array(bottom_color, dtype=float)
-    t = np.linspace(0, 1, h).reshape(h, 1, 1)
-    gradient = (top * (1 - t) + bottom * t).astype(np.uint8)
-    gradient = np.repeat(gradient, w, axis=1)
-    img = Image.fromarray(gradient, mode="RGB")
-    return apply_vignette(img, size)
-
+    w,h = size
+    vig  = Image.new("L", size, 0)
+    vd   = ImageDraw.Draw(vig)
+    vd.ellipse([-w*.3,-h*.3,w*1.3,h*1.3], fill=255)
+    vig  = vig.filter(ImageFilter.GaussianBlur(int(100*RENDER_SCALE)))
+    dark = Image.new("RGB", size, (0,0,0))
+    return Image.composite(img, dark, vig)
 
 def make_background(size):
-    wants_custom = BACKGROUND_THEME.lower() in ("custom", "custom image", "my custom image", "my uploaded image")
+    wants_custom = BACKGROUND_THEME.lower() in ("custom","custom image")
     if wants_custom:
-        custom_path = find_custom_background()
-        if custom_path:
-            print(f"Using custom background: {custom_path}")
-            return load_custom_background(custom_path, size)
-        print("Custom background requested but none found — using a gradient instead.")
-    return make_gradient_background(size)
+        for ext in (".jpg",".jpeg",".png"):
+            p = os.path.join(CUSTOM_BG_DIR, "custom_background"+ext)
+            if os.path.exists(p):
+                img = Image.open(p).convert("RGB")
+                tw,th = size
+                sw,sh = img.size
+                scale = max(tw/sw, th/sh)
+                img = img.resize((int(sw*scale),int(sh*scale)), Image.LANCZOS)
+                l=(img.width-tw)//2; t=(img.height-th)//2
+                img = img.crop((l,t,l+tw,t+th))
+                return apply_vignette(img, size)
+        print("Custom BG not found — using gradient.")
 
+    if BACKGROUND_THEME in GRADIENT_PALETTES:
+        top_c, bot_c = GRADIENT_PALETTES[BACKGROUND_THEME]
+    else:
+        top_c, bot_c = random.choice(list(GRADIENT_PALETTES.values()))
 
-def pick_music_file():
-    music_files = sorted(f for f in os.listdir(MUSIC_DIR) if f.lower().endswith(".mp3"))
-    if not music_files:
-        raise FileNotFoundError(f"No .mp3 files found in {MUSIC_DIR}")
-    if MUSIC_CHOICE and MUSIC_CHOICE.lower() != "random":
-        for f in music_files:
+    w,h = size
+    top = np.array(top_c, dtype=float)
+    bot = np.array(bot_c, dtype=float)
+    t_  = np.linspace(0,1,h).reshape(h,1,1)
+    grad = (top*(1-t_)+bot*t_).astype(np.uint8)
+    grad = np.repeat(grad, w, axis=1)
+    img  = Image.fromarray(grad, "RGB")
+    return apply_vignette(img, size)
+
+def pick_music():
+    files = sorted(f for f in os.listdir(MUSIC_DIR) if f.lower().endswith(".mp3"))
+    if not files: raise FileNotFoundError(f"No mp3 in {MUSIC_DIR}")
+    if MUSIC_CHOICE.lower() != "random":
+        for f in files:
             if f.lower() == MUSIC_CHOICE.lower():
                 return os.path.join(MUSIC_DIR, f)
-        print(f"Warning: '{MUSIC_CHOICE}' not found, picking randomly instead.")
-    return os.path.join(MUSIC_DIR, random.choice(music_files))
+    return os.path.join(MUSIC_DIR, random.choice(files))
 
 
-# ---------------- Sheets / YouTube ----------------
+# ==================== SHEETS / YOUTUBE ====================
 
-def get_user_credentials():
+def get_creds():
     return UserCredentials(
         None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"],
-        token_uri="https://oauth2.googleapis.com/token",
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/youtube.upload",
-        ],
+        refresh_token   = os.environ["YT_REFRESH_TOKEN"],
+        client_id       = os.environ["YT_CLIENT_ID"],
+        client_secret   = os.environ["YT_CLIENT_SECRET"],
+        token_uri       = "https://oauth2.googleapis.com/token",
+        scopes          = ["https://www.googleapis.com/auth/spreadsheets",
+                           "https://www.googleapis.com/auth/youtube.upload"],
     )
-
-
-def get_sheets_service(creds):
-    return build("sheets", "v4", credentials=creds)
-
-
-def get_youtube_service(creds):
-    return build("youtube", "v3", credentials=creds)
-
 
 def fetch_next_row(service):
-    """A = Telugu, B = English, C = optional explanation, D = 'used' marker."""
-    range_ = f"{SHEET_TAB}!A2:D"
-    result = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_).execute()
-    rows = result.get("values", [])
-    for i, row in enumerate(rows):
-        telugu = row[0] if len(row) > 0 else ""
-        english = row[1] if len(row) > 1 else ""
-        explanation = row[2] if len(row) > 2 else ""
-        used = row[3] if len(row) > 3 else ""
-        if (telugu or english) and used.strip().lower() != "used":
-            row_number = i + 2
-            return row_number, telugu.strip(), english.strip(), explanation.strip()
+    r = service.spreadsheets().values().get(
+        spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!A2:D").execute()
+    for i, row in enumerate(r.get("values",[])):
+        te  = (row[0] if len(row)>0 else "").strip()
+        en  = (row[1] if len(row)>1 else "").strip()
+        exp = (row[2] if len(row)>2 else "").strip()
+        used= (row[3] if len(row)>3 else "").strip().lower()
+        if (te or en) and used != "used":
+            return i+2, te, en, exp
     return None, None, None, None
 
-
-def mark_row_used(service, row_number):
+def mark_used(service, row):
     service.spreadsheets().values().update(
-        spreadsheetId=SHEET_ID,
-        range=f"{SHEET_TAB}!D{row_number}",
-        valueInputOption="RAW",
-        body={"values": [["used"]]},
-    ).execute()
+        spreadsheetId=SHEET_ID, range=f"{SHEET_TAB}!D{row}",
+        valueInputOption="RAW", body={"values":[["used"]]}).execute()
 
 
-# ---------------- text fitting + drawing ----------------
+# ==================== TEXT UTILITIES ====================
 
-def text_width(draw, text, font):
-    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=STROKE_WIDTH)
-    return bbox[2] - bbox[0]
-
-
-def normalize_manual_breaks(text):
-    """A break placed by hand in the sheet may arrive in several forms
-    depending on how it was typed or pasted:
-    - a real newline (Alt+Enter / Option+Return in the cell)
-    - literal "\n" typed as two characters (backslash + n)
-    - literal "\\n" — an extra escaped backslash, common when text is
-      copy-pasted from a source that already escapes backslashes
-    - a Windows-style "\r\n", or a stray lone "\r"
-    All of these are normalized to a single real newline so downstream
-    code only ever has to handle one case."""
-    if text is None:
-        return text
-    text = text.replace("\\\\n", "\n")   # escaped backslash + n  -> break (handle first)
-    text = text.replace("\\n", "\n")      # plain backslash + n    -> break
-    text = text.replace("\r\n", "\n")     # Windows real newline   -> break
-    text = text.replace("\r", "\n")       # stray carriage return  -> break
+def normalize_breaks(text):
+    if not text: return text
+    text = text.replace("\\\\n","\n").replace("\\n","\n")
+    text = text.replace("\r\n","\n").replace("\r","\n")
     return text
 
+def text_w(draw, text, font):
+    bb = draw.textbbox((0,0), text, font=font, stroke_width=STROKE_INNER_WIDTH)
+    return bb[2]-bb[0]
 
-def wrap_text(draw, text, font, max_width):
-    """Wraps text to max_width. Any manual break ("\n") in the text always
-    starts a new line first — each segment between manual breaks is then
-    auto-wrapped independently by pixel width, so a break you place in the
-    sheet is never overridden by the automatic wrapping."""
-    text = normalize_manual_breaks(text)
+def wrap(draw, text, font, max_w):
+    """Respect manual \n breaks, then auto-wrap each segment by pixel width."""
+    text  = normalize_breaks(text)
     lines = []
-    for segment in text.split("\n"):
-        words = segment.split()
-        current = ""
-        for word in words:
-            test = f"{current} {word}".strip()
-            if text_width(draw, test, font) <= max_width:
-                current = test
+    for seg in text.split("\n"):
+        words, cur = seg.split(), ""
+        for w in words:
+            test = f"{cur} {w}".strip()
+            if text_w(draw, test, font) <= max_w:
+                cur = test
             else:
-                if current:
-                    lines.append(current)
-                current = word
-        lines.append(current)  # keep even if blank, to preserve an intentional blank line
+                if cur: lines.append(cur)
+                cur = w
+        lines.append(cur)
     return lines
 
+def line_height(font):
+    asc, dsc = font.getmetrics()
+    return int(round(asc + dsc + LINE_GAP_PT * PT_TO_PX * RENDER_SCALE))
 
-def compute_line_height(font):
-    """Real line height: the font's own ascent+descent, plus a fixed 2pt
-    gap — not a multiplier of font size, so the gap stays exactly 2pt
-    (scaled for the render resolution) regardless of how much the font
-    has been shrunk to fit."""
-    ascent, descent = font.getmetrics()
-    gap_px = LINE_GAP_PT * PT_TO_PX * RENDER_SCALE
-    return int(round(ascent + descent + gap_px))
-
-
-def fit_text_block(draw, full_text, font_path, initial_size, max_width, max_height, min_size=None):
-    """Shrinks font until the full text wraps into a block that fits the
-    available height. Floor defaults to a resolution-scaled 16pt, but a
-    phase can pass a higher min_size (e.g. Column C's note text) so long
-    text doesn't shrink far more than the main verse just because it has
-    more words. If it still doesn't fit at the floor, it renders at the
-    floor anyway (slight overflow) rather than shrinking further."""
-    size = initial_size
-    absolute_floor = min_size if min_size is not None else max(16, int(16 * RENDER_SCALE))
-    while size >= absolute_floor:
-        font = ImageFont.truetype(font_path, size)
-        lines = wrap_text(draw, full_text, font, max_width)
-        line_height = compute_line_height(font)
-        if len(lines) * line_height <= max_height:
-            return font, lines, line_height
-        size -= 2
-    font = ImageFont.truetype(font_path, absolute_floor)
-    lines = wrap_text(draw, full_text, font, max_width)
-    return font, lines, compute_line_height(font)
+def fit_font(draw, text, path, initial, min_sz, max_w, max_h):
+    """Shrink font until full text fits on screen, or stop at min_sz."""
+    sz = initial
+    while sz >= min_sz:
+        f   = ImageFont.truetype(path, sz)
+        ls  = wrap(draw, text, f, max_w)
+        lh  = line_height(f)
+        if len(ls)*lh <= max_h:
+            return f, ls, lh
+        sz -= 2
+    f  = ImageFont.truetype(path, min_sz)
+    ls = wrap(draw, text, f, max_w)
+    return f, ls, line_height(f)
 
 
-def make_vertical_gradient(size, color_top, color_bottom):
-    w, h = size
-    top = np.array(color_top, dtype=float)
-    bottom = np.array(color_bottom, dtype=float)
-    t = np.linspace(0, 1, h).reshape(h, 1, 1)
-    grad = (top * (1 - t) + bottom * t).astype(np.uint8)
-    grad = np.repeat(grad, w, axis=1)
-    return Image.fromarray(grad, mode="RGB")
+# ==================== CINEMATIC TEXT DRAWING ====================
+# The gradient is built only over the text-block's height (not the full
+# frame), so the gold shift is always clearly visible.
 
+def _make_gradient_strip(w, h, top_c, bot_c):
+    """Build a gradient image exactly h pixels tall, full width w."""
+    top = np.array(top_c, dtype=float)
+    bot = np.array(bot_c, dtype=float)
+    t   = np.linspace(0,1,max(h,1)).reshape(-1,1,1)
+    arr = (top*(1-t)+bot*t).astype(np.uint8)
+    arr = np.repeat(arr, w, axis=1)
+    return Image.fromarray(arr, "RGB")
 
-def draw_cinematic_text(img, draw, text, font, x, y, fill_top, fill_bottom, outlay_fill, inner_edge, block_top, block_height):
-    """Cinematic text: drop shadow -> thick solid outlay border -> a
-    vertical-gradient inlay fill clipped to the glyph shapes -> a thin
-    crisp inner edge on top for definition.
-    
-    block_top / block_height define the vertical span of the WHOLE text block
-    so the gradient runs from fill_top at the first line to fill_bottom at the
-    last — making the color shift clearly visible rather than landing on one
-    washed-out mid-point of a full-frame gradient."""
-    # drop shadow
-    draw.text((x + SHADOW_OFFSET, y + SHADOW_OFFSET), text, font=font, fill=(0, 0, 0))
+def draw_line_cinematic(img, draw, text, font, x, y, colors, block_top, block_h):
+    """Draw one line with: shadow → outlay border → inner edge → gradient inlay."""
+    ft, fb, outlay, inner = colors
+    # 1. drop shadow
+    draw.text((x+SHADOW_OFFSET, y+SHADOW_OFFSET), text, font=font, fill=(0,0,0))
+    # 2. thick outlay border
+    draw.text((x,y), text, font=font, fill=outlay,
+              stroke_width=STROKE_OUTLAY_WIDTH, stroke_fill=outlay)
+    # 3. thin crisp inner ring
+    draw.text((x,y), text, font=font, fill=inner,
+              stroke_width=STROKE_INNER_WIDTH, stroke_fill=inner)
+    # 4. gradient inlay — built over block height so shift is visible
+    mask = Image.new("L", img.size, 0)
+    ImageDraw.Draw(mask).text((x,y), text, font=font, fill=255)
+    bh   = max(block_h, 1)
+    strip = _make_gradient_strip(img.width, bh, ft, fb)
+    canvas = Image.new("RGB", img.size, (0,0,0))
+    canvas.paste(strip, (0, block_top))
+    img.paste(canvas, (0,0), mask)
 
-    # outlay: thick solid border
-    draw.text((x, y), text, font=font, fill=outlay_fill,
-               stroke_width=OUTLAY_STROKE_WIDTH, stroke_fill=outlay_fill)
-
-    # thin crisp inner edge
-    draw.text((x, y), text, font=font, fill=inner_edge,
-               stroke_width=max(1, STROKE_WIDTH // 3), stroke_fill=inner_edge)
-
-    # inlay: gradient built across the BLOCK height only, then pasted at
-    # the correct y-offset inside the full frame so each line gets its
-    # proportional color slice and the result is clearly visible gold.
-    mask_img = Image.new("L", img.size, 0)
-    mask_draw = ImageDraw.Draw(mask_img)
-    mask_draw.text((x, y), text, font=font, fill=255)
-
-    bh = max(block_height, 1)
-    grad_strip = Image.new("RGB", (img.size[0], bh))
-    gd = ImageDraw.Draw(grad_strip)
-    top_c = np.array(fill_top, dtype=float)
-    bot_c = np.array(fill_bottom, dtype=float)
-    for row in range(bh):
-        t = row / bh
-        color = tuple((top_c * (1 - t) + bot_c * t).astype(np.uint8).tolist())
-        gd.line([(0, row), (img.size[0], row)], fill=color)
-
-    # paste the strip onto a full-frame canvas at block_top so coordinates align
-    gradient = Image.new("RGB", img.size, (0, 0, 0))
-    gradient.paste(grad_strip, (0, block_top))
-    img.paste(gradient, (0, 0), mask_img)
-
-
-def draw_text_block(img, draw, lines, font, line_height, size, y_offset, colors):
-    fill_top, fill_bottom, outlay_fill, inner_edge = colors
-    total_height = len(lines) * line_height
-    block_top = int((size[1] - total_height) // 2 - 40 + y_offset)
+def draw_block(img, draw, lines, font, lh, size, y_offset, colors, alpha=1.0):
+    """Draw a block of lines; alpha for crossfade blending."""
+    total_h = len(lines) * lh
+    block_top = int((size[1]-total_h)//2 - 30 + y_offset)
     y = block_top
-    for line in lines:
-        w = text_width(draw, line, font)
-        x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
-        draw_cinematic_text(img, draw, line, font, x, y,
-                            fill_top, fill_bottom, outlay_fill, inner_edge,
-                            block_top, total_height)
-        y += line_height
+    if alpha < 1.0:
+        tmp = img.copy()
+        tmp_draw = ImageDraw.Draw(tmp)
+        for line in lines:
+            w = text_w(tmp_draw, line, font)
+            x = max(TEXT_MARGIN_X, (size[0]-w)//2)
+            draw_line_cinematic(tmp, tmp_draw, line, font, x, y, colors, block_top, total_h)
+            y += lh
+        return Image.blend(img, tmp, alpha)
+    else:
+        for line in lines:
+            w = text_w(draw, line, font)
+            x = max(TEXT_MARGIN_X, (size[0]-w)//2)
+            draw_line_cinematic(img, draw, line, font, x, y, colors, block_top, total_h)
+            y += lh
+        return img
 
 
-# ---------------- scene / phase building ----------------
+# ==================== PHASE BUILDING ====================
 
-def build_phase(text, style, size, column):
-    """Prepares one phase: picks font/size/colors by script + style, and fits
-    the full text to the whole available frame (each phase gets the screen
-    to itself, so nothing ever fights another block for space)."""
-    telugu = is_telugu(text)
-    font_path = FONT_PATH_TELUGU if telugu else FONT_PATH_LATIN
-    initial_size = MAIN_FONT_SIZE_TELUGU if telugu else MAIN_FONT_SIZE_LATIN
+def build_phase(text, col, size):
+    """Return a phase dict with pre-fitted font and line list."""
+    telugu   = is_telugu(text)
+    path     = FONT_PATH_TELUGU if telugu else FONT_PATH_ENGLISH
+    init_sz  = {"A": FONT_SIZE_A, "B": FONT_SIZE_B, "C": FONT_SIZE_C}[col]
+    colors   = {"A": COLORS_A,    "B": COLORS_B,    "C": COLORS_C}[col]
+    max_w    = size[0] - TEXT_MARGIN_X*2
+    max_h    = size[1] - SAFE_TOP - SAFE_BOTTOM
 
-    if style == "main":
-        # Inlay: soft ivory fading to rich gold. Outlay: deep espresso-bronze
-        # (replaces the previous green outline) for a premium, cinematic,
-        # engraved-plaque look that reads clearly on any background.
-        colors = ((255, 248, 225), (255, 209, 112), (25, 15, 8), (128, 82, 24))
-    else:  # "note" — the optional explanation, same size as main, distinct palette
-        # Inlay: warm amber-gold, slightly deeper than the main text so the
-        # two remain easy to tell apart. Same espresso-bronze outlay for
-        # visual consistency across the whole video.
-        colors = ((255, 233, 186), (224, 160, 64), (25, 15, 8), (107, 66, 18))
+    probe    = Image.new("RGB", size)
+    pd       = ImageDraw.Draw(probe)
+    font, lines, lh = fit_font(pd, text, path, init_sz, FONT_SIZE_MIN, max_w, max_h)
 
-    max_width = size[0] - (TEXT_MARGIN_X * 2)
-    max_height = size[1] - SAFE_TOP - SAFE_BOTTOM
-
-    # Note text (Column C) is usually longer than the verse, so it would
-    # otherwise auto-shrink much smaller than Column A/B just to fit. Give it
-    # a much higher floor — 80% of its starting size — so it stays visually
-    # close in size; if it truly can't fit at that floor it will slightly
-    # overflow rather than keep shrinking.
-    min_size = int(initial_size * 0.8) if style == "note" else None
-
-    probe_img = Image.new("RGB", size)
-    probe_draw = ImageDraw.Draw(probe_img)
-    font, lines, line_height = fit_text_block(
-        probe_draw, text, font_path, initial_size, max_width, max_height, min_size=min_size
-    )
-
-    return {
-        "text": text, "font": font, "lines": lines, "line_height": line_height,
-        "colors": colors, "column": column,
-    }
+    # Assign fixed duration; scaled later if columns are missing.
+    duration = COLUMN_DURATIONS[col]
+    return {"col":col,"text":text,"font":font,"lines":lines,"lh":lh,
+            "colors":colors,"duration":duration}
 
 
-def render_video_frame(background, size, phases, t, stars):
-    img = background.copy()
+# ==================== LINE-BY-LINE REVEAL ====================
+
+def lines_state(phase, t_local):
+    """Return (current_lines, next_lines, fade_alpha) for line-by-line reveal.
+    Each line holds LINE_HOLD_SECONDS then crossfades to the next line."""
+    lines = phase["lines"]
+    n     = len(lines)
+    if n == 0: return [], [], 1.0
+
+    slot_dur  = LINE_HOLD_SECONDS + LINE_FADE_SECONDS
+    total_seq = n * slot_dur
+    # Clamp so the last line stays on for the rest of the phase.
+    t_clamped = min(t_local, total_seq - LINE_FADE_SECONDS)
+
+    idx   = min(int(t_clamped // slot_dur), n-1)
+    tl    = t_clamped - idx*slot_dur
+
+    if tl >= LINE_HOLD_SECONDS and idx < n-1:
+        alpha = (tl - LINE_HOLD_SECONDS) / LINE_FADE_SECONDS
+        alpha = max(0.0, min(1.0, alpha))
+        return [lines[idx]], [lines[idx+1]], alpha
+    else:
+        return [lines[idx]], [], 1.0
+
+
+# ==================== FRAME RENDERER ====================
+
+def render_frame(bg, size, phases, t, stars):
+    img  = bg.copy()
     draw = ImageDraw.Draw(img)
 
     draw_neon_border(draw, size, t)
-    draw_twinkling_stars(draw, stars, t)
+    draw_stars(draw, stars, t)
 
-    num_phases = len(phases)
-
-    # Each phase has its own fixed duration (Column A/B/C timing) rather than
-    # an equal split — find which phase "t" currently falls into.
-    idx = 0
-    elapsed = 0.0
+    # Locate which phase is active.
+    idx, elapsed = 0, 0.0
     for i, ph in enumerate(phases):
-        if t < elapsed + ph["duration"] or i == num_phases - 1:
-            idx = i
-            break
+        if t < elapsed + ph["duration"] or i == len(phases)-1:
+            idx = i; break
         elapsed += ph["duration"]
-    phase_duration = phases[idx]["duration"]
-    tl = t - elapsed
-    phase = phases[idx]
 
-    in_transition = tl >= (phase_duration - TRANSITION_SECONDS) and idx < num_phases - 1
-    reveal_duration = phase.get("reveal_duration", 0)
+    phase   = phases[idx]
+    t_local = t - elapsed
+    ph_dur  = phase["duration"]
 
-    if in_transition:
-        progress = (tl - (phase_duration - TRANSITION_SECONDS)) / TRANSITION_SECONDS
-        progress = max(0.0, min(1.0, progress))
-        ease = progress * progress * (3 - 2 * progress)  # smoothstep
+    # Check if we're in the inter-column scroll transition.
+    in_scroll = (t_local >= ph_dur - TRANSITION_SECONDS) and idx < len(phases)-1
 
-        out_offset = -ease * (size[1])
-        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["colors"])
-
-        next_phase = phases[idx + 1]
-        # If the incoming phase is paged (Column C), scroll in showing its
-        # first page/group only — not the entire unwrapped block.
-        next_lines = next_phase["pages"][0] if "pages" in next_phase else next_phase["lines"]
-        in_offset = (1 - ease) * size[1]
-        draw_text_block(img, draw, next_lines, next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"])
-
-    elif idx == 0 and tl < reveal_duration:
-        words = phase["text"].split()
-        n_words = len(words)
-        words_to_show = min(n_words, int(tl / SECONDS_PER_WORD) + 1) if SECONDS_PER_WORD > 0 else n_words
-        visible_text = " ".join(words[:words_to_show])
-        max_width = size[0] - (TEXT_MARGIN_X * 2)
-        lines = wrap_text(draw, visible_text, phase["font"], max_width)
-        draw_text_block(img, draw, lines, phase["font"], phase["line_height"], size, 0, phase["colors"])
-
-    elif "pages" in phase:
-        # Column C: cycle through its grouped lines sequentially within its
-        # own time budget, with a short crossfade between groups.
-        pages = phase["pages"]
-        page_duration = phase["page_duration"]
-        num_pages = len(pages)
-        page_idx = min(int(tl // page_duration), num_pages - 1)
-        local = tl - page_idx * page_duration
-        crossfade = min(NOTE_PAGE_CROSSFADE_SECONDS, page_duration * 0.3)
-
-        if page_idx > 0 and local < crossfade:
-            alpha = local / crossfade if crossfade > 0 else 1.0
-            prev_img = img.copy()
-            prev_draw = ImageDraw.Draw(prev_img)
-            draw_text_block(prev_img, prev_draw, pages[page_idx - 1], phase["font"], phase["line_height"], size, 0, phase["colors"])
-            curr_img = img.copy()
-            curr_draw = ImageDraw.Draw(curr_img)
-            draw_text_block(curr_img, curr_draw, pages[page_idx], phase["font"], phase["line_height"], size, 0, phase["colors"])
-            img = Image.blend(prev_img, curr_img, alpha)
-        else:
-            draw_text_block(img, draw, pages[page_idx], phase["font"], phase["line_height"], size, 0, phase["colors"])
-
+    if in_scroll:
+        prog  = (t_local-(ph_dur-TRANSITION_SECONDS)) / TRANSITION_SECONDS
+        ease  = prog*prog*(3-2*prog)
+        # Current column scrolls out upward.
+        cur_lines, nxt_lines, _ = lines_state(phase, ph_dur - TRANSITION_SECONDS)
+        out_off = -ease * size[1]
+        img = draw_block(img, draw, cur_lines, phase["font"], phase["lh"],
+                         size, out_off, phase["colors"])
+        # Next column scrolls in from below.
+        nxt = phases[idx+1]
+        nxt_first = [nxt["lines"][0]] if nxt["lines"] else []
+        in_off  = (1-ease) * size[1]
+        draw2   = ImageDraw.Draw(img)
+        img = draw_block(img, draw2, nxt_first, nxt["font"], nxt["lh"],
+                         size, in_off, nxt["colors"])
     else:
-        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, 0, phase["colors"])
+        cur, nxt, alpha = lines_state(phase, t_local)
+        img = draw_block(img, draw, cur, phase["font"], phase["lh"],
+                         size, 0, phase["colors"])
+        if nxt and alpha < 1.0:
+            draw2 = ImageDraw.Draw(img)
+            img   = draw_block(img, draw2, nxt, phase["font"], phase["lh"],
+                                size, 0, phase["colors"], alpha=alpha)
 
     return np.array(img.convert("RGB"))
 
 
+# ==================== VIDEO BUILD ====================
+
 def build_video(telugu_text, english_text, explanation_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-
     size = VIDEO_SIZE
-    background = make_background(size)
-    stars = make_star_positions(size)
+    bg   = make_background(size)
+    strs = make_stars(size)
 
-    phase_specs = []
-    if telugu_text:
-        phase_specs.append((telugu_text, "main", "A"))
-    if english_text:
-        phase_specs.append((english_text, "main", "B"))
+    specs = []
+    if telugu_text:      specs.append((telugu_text,      "A"))
+    if english_text:     specs.append((english_text,     "B"))
 
-    include_explanation = bool(explanation_text) and INCLUDE_EXPLANATION != "no"
-    if INCLUDE_EXPLANATION == "yes" and not explanation_text:
-        include_explanation = False
-    if include_explanation:
-        phase_specs.append((explanation_text, "note", "C"))
+    inc_exp = bool(explanation_text) and INCLUDE_EXPLANATION != "no"
+    if INCLUDE_EXPLANATION == "yes" and not explanation_text: inc_exp = False
+    if inc_exp:          specs.append((explanation_text, "C"))
 
-    if not phase_specs:
-        raise ValueError("No text to render — Telugu and English are both empty.")
+    if not specs: raise ValueError("No text to render.")
 
-    phases = [build_phase(text, style, size, column) for text, style, column in phase_specs]
+    phases = [build_phase(text, col, size) for text, col in specs]
 
-    # Fixed per-column durations (A=15s, B=12s, C=18s). If a column is
-    # missing, the remaining columns are scaled up proportionally so the
-    # video always totals exactly VIDEO_DURATION.
-    intended_total = sum(COLUMN_DURATIONS[p["column"]] for p in phases)
-    scale = VIDEO_DURATION / intended_total if intended_total > 0 else 1
+    # Scale durations so they always total exactly VIDEO_DURATION.
+    intended = sum(p["duration"] for p in phases)
+    scale    = VIDEO_DURATION / intended if intended else 1
     for p in phases:
-        p["duration"] = COLUMN_DURATIONS[p["column"]] * scale
+        p["duration"] *= scale
 
-    n_words_first = len(phases[0]["text"].split())
-    phases[0]["reveal_duration"] = min(n_words_first * SECONDS_PER_WORD, MAX_REVEAL_SECONDS, phases[0]["duration"] * 0.6)
-
-    # Column C (the note/explanation) often has many lines. Rather than
-    # cramming them all into one shrunken block, group them into readable
-    # "pages" shown sequentially within Column C's own time budget.
-    # Each page is screen-fitted independently so it never overflows.
-    for p in phases:
-        if p["column"] != "C":
-            continue
-        font = p["font"]
-        line_height = p["line_height"]
-        max_height = size[1] - SAFE_TOP - SAFE_BOTTOM
-
-        # How many lines fit on screen at once for this font size?
-        lines_per_screen = max(1, int(max_height // line_height))
-
-        all_lines = p["lines"]
-        total_lines = len(all_lines)
-
-        # Target page count from timing budget, but never exceed what the
-        # screen can fit per page or go under 1 line per page.
-        target_pages = max(1, round(p["duration"] / NOTE_SECONDS_PER_PAGE))
-        num_pages = max(1, min(target_pages, total_lines))
-        lines_per_page = min(lines_per_screen, math.ceil(total_lines / num_pages))
-
-        pages = [all_lines[i:i + lines_per_page] for i in range(0, total_lines, lines_per_page)] or [[]]
-        p["pages"] = pages
-        p["page_duration"] = p["duration"] / len(pages)
-
-    # Frames are rendered on demand by moviepy (one at a time) rather than all
-    # built into a Python list up front. At 4K, holding every frame in memory
-    # simultaneously would need ~25GB+ of RAM for a 45s clip — this streams
-    # instead, so memory use stays flat regardless of resolution or duration.
     def make_frame(t):
-        return render_video_frame(background, size, phases, t, stars)
+        return render_frame(bg, size, phases, t, strs)
 
-    clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
+    clip  = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
+    music = AudioFileClip(pick_music()).subclip(MUSIC_START_OFFSET,
+                                               MUSIC_START_OFFSET+VIDEO_DURATION)
+    clip  = clip.set_audio(music)
 
-    chosen_music = pick_music_file()
-    audio = AudioFileClip(chosen_music).subclip(MUSIC_START_OFFSET, MUSIC_START_OFFSET + VIDEO_DURATION)
-    clip = clip.set_audio(audio)
-
-    output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
-    # 4K needs a much higher bitrate than 720p to actually look sharp —
-    # libx264 defaults would otherwise compress it down to mushy quality.
-    clip.write_videofile(
-        output_path, fps=FPS, codec="libx264", audio_codec="aac",
-        bitrate="40M", preset="medium",
-        ffmpeg_params=["-pix_fmt", "yuv420p"],
-    )
-    return output_path
+    out = os.path.join(OUTPUT_DIR, "verse_video.mp4")
+    clip.write_videofile(out, fps=FPS, codec="libx264", audio_codec="aac",
+                         bitrate="12M", preset="fast",
+                         ffmpeg_params=["-pix_fmt","yuv420p"])
+    return out
 
 
-def upload_to_youtube(youtube, video_path, telugu_text, english_text):
-    base_text = english_text or telugu_text
-    title_source = re.sub(r"\([^()]*\)\s*$", "", base_text).strip()
-    title = (title_source[:80] + "...") if len(title_source) > 80 else title_source
-    if not title:
-        title = "Daily Bible Verse"
+# ==================== YOUTUBE UPLOAD ====================
 
-    hashtags = generate_hashtags(telugu_text, english_text)
-    description = f"{telugu_text}\n\n{english_text}\n\n" + " ".join(hashtags)
+def upload(youtube, path, telugu_text, english_text):
+    src   = english_text or telugu_text
+    title = re.sub(r"\([^()]*\)\s*$","",src).strip()[:80]
+    if not title: title = "Daily Bible Verse"
 
-    privacy = PRIVACY_STATUS if PRIVACY_STATUS in ("private", "public", "unlisted") else "private"
+    tags  = generate_hashtags(telugu_text, english_text)
+    desc  = f"{telugu_text}\n\n{english_text}\n\n"+" ".join(tags)
+    priv  = PRIVACY_STATUS if PRIVACY_STATUS in ("private","public","unlisted") else "private"
 
-    body = {
-        "snippet": {
-            "title": title[:100],
-            "description": description,
-            "categoryId": "22",
-            "tags": [t.lstrip("#") for t in hashtags],
-        },
-        "status": {"privacyStatus": privacy},
-    }
+    body  = {"snippet":{"title":title[:100],"description":desc,
+                         "categoryId":"22","tags":[t.lstrip("#") for t in tags]},
+             "status":{"privacyStatus":priv}}
+    media = MediaFileUpload(path, chunksize=-1, resumable=True, mimetype="video/mp4")
+    req   = youtube.videos().insert(part="snippet,status",body=body,media_body=media)
+    resp  = None
+    while resp is None:
+        st, resp = req.next_chunk()
+        if st: print(f"Upload {int(st.progress()*100)}%")
+    print(f"Uploaded: {resp['id']} ({priv})")
+    return resp["id"]
 
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-    response = None
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            print(f"Upload progress: {int(status.progress() * 100)}%")
-    print(f"Uploaded video ID: {response['id']} (privacy: {privacy})")
-    return response["id"]
 
+# ==================== MAIN ====================
 
 def main():
-    creds = get_user_credentials()
-    sheets_service = get_sheets_service(creds)
+    creds   = get_creds()
+    sheets  = build("sheets","v4",credentials=creds)
+    youtube = build("youtube","v3",credentials=creds)
 
     row_number = None
     if TELUGU_OVERRIDE or ENGLISH_OVERRIDE:
-        telugu_text, english_text, explanation_text = TELUGU_OVERRIDE, ENGLISH_OVERRIDE, EXPLANATION_OVERRIDE
-        print(f"Using override text — Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
+        te, en, exp = TELUGU_OVERRIDE, ENGLISH_OVERRIDE, EXPLANATION_OVERRIDE
+        print(f"Override: te={te!r}  en={en!r}  exp={exp!r}")
     else:
-        row_number, telugu_text, english_text, explanation_text = fetch_next_row(sheets_service)
-        if not telugu_text and not english_text:
-            print("No unused rows found in the sheet. Exiting.")
+        row_number, te, en, exp = fetch_next_row(sheets)
+        if not te and not en:
+            print("No unused rows. Exiting.")
             sys.exit(0)
-        print(f"Selected row {row_number} — Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
+        print(f"Row {row_number}: te={te!r}  en={en!r}  exp={exp!r}")
 
-    video_path = build_video(telugu_text, english_text, explanation_text)
-
-    youtube_service = get_youtube_service(creds)
-    upload_to_youtube(youtube_service, video_path, telugu_text, english_text)
-
-    if row_number is not None:
-        mark_row_used(sheets_service, row_number)
-
+    path = build_video(te, en, exp)
+    upload(youtube, path, te, en)
+    if row_number:
+        mark_used(sheets, row_number)
     print("Done.")
-
 
 if __name__ == "__main__":
     main()
