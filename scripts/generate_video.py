@@ -21,7 +21,7 @@ from googleapiclient.http import MediaFileUpload
 # Column D = "used" marker, written automatically by this script
 # ==================================================
 
-SHEET_ID = os.environ["1JdImkWazXD23T52brRN0OYT8FP6S9-G2d_ivBvcduMc"]
+SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
 
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
