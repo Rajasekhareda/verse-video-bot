@@ -1,3 +1,5 @@
+from google.oauth2 import service_account
+import json
 import os
 import sys
 import re
@@ -325,8 +327,13 @@ def get_user_credentials():
     )
 
 
-def get_sheets_service(creds):
-    return build("sheets", "v4", credentials=creds)
+def get_sheets_service():
+    sa_info = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+    sa_creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=sa_creds)
 
 
 def get_youtube_service(creds):
@@ -740,8 +747,7 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
 
 
 def main():
-    creds = get_user_credentials()
-    sheets_service = get_sheets_service(creds)
+    sheets_service = get_sheets_service()
 
     row_number = None
     if TELUGU_OVERRIDE or ENGLISH_OVERRIDE:
