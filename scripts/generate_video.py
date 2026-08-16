@@ -692,20 +692,20 @@ def build_video(telugu_text, english_text, explanation_text):
     # instead, so memory use stays flat regardless of resolution or duration.
     def make_frame(t):
         return render_video_frame(background, size, phases, t, stars)
-
-    clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
-   chosen_music = pick_music_file()
-                    music_source = AudioFileClip(chosen_music)
-                    end_time = min(MUSIC_START_OFFSET + VIDEO_DURATION, music_source.duration)
-                    audio = music_source.subclip(MUSIC_START_OFFSET, end_time)
-                    clip = clip.set_audio(audio)
-                    output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
+clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
+    chosen_music = pick_music_file()
+    music_source = AudioFileClip(chosen_music)
+    end_time = min(MUSIC_START_OFFSET + VIDEO_DURATION, music_source.duration)
+    audio = music_source.subclip(MUSIC_START_OFFSET, end_time)
+    clip = clip.set_audio(audio)
+    output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
     # 4K needs a much higher bitrate than 720p to actually look sharp —
     # libx264 defaults would otherwise compress it down to mushy quality.
     clip.write_videofile(
-                        output_path, fps=FPS, codec="libx264", audio_codec="aac",
-                        bitrate="40M", preset="medium",
-                        ffmpeg_params=["-pix_fmt", "yuv420p"],    )
+        output_path, fps=FPS, codec="libx264", audio_codec="aac",
+        bitrate="40M", preset="medium",
+        ffmpeg_params=["-pix_fmt", "yuv420p"],
+    )
     return output_path
 def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     base_text = english_text or telugu_text
