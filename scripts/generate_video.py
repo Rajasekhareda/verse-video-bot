@@ -692,7 +692,7 @@ def build_video(telugu_text, english_text, explanation_text):
     # instead, so memory use stays flat regardless of resolution or duration.
     def make_frame(t):
         return render_video_frame(background, size, phases, t, stars)
-clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
+    clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
     chosen_music = pick_music_file()
     music_source = AudioFileClip(chosen_music)
     end_time = min(MUSIC_START_OFFSET + VIDEO_DURATION, music_source.duration)
