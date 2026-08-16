@@ -744,7 +744,9 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
             print(f"Upload progress: {int(status.progress() * 100)}%")
     print(f"Uploaded video ID: {response['id']} (privacy: {privacy})")
     return response["id"]
-
+def main():
+    creds = get_user_credentials()
+    sheets_service = get_sheets_service()
 
 def main():
     sheets_service = get_sheets_service()
