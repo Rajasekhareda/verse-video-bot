@@ -699,8 +699,6 @@ clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
     audio = music_source.subclip(MUSIC_START_OFFSET, end_time)
     clip = clip.set_audio(audio)
     output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
-    # 4K needs a much higher bitrate than 720p to actually look sharp —
-    # libx264 defaults would otherwise compress it down to mushy quality.
     clip.write_videofile(
         output_path, fps=FPS, codec="libx264", audio_codec="aac",
         bitrate="40M", preset="medium",
