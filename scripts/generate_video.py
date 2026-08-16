@@ -7,11 +7,9 @@ import math
 import random
 import colorsys
 import unicodedata
-
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from moviepy.editor import VideoClip, AudioFileClip
-
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -422,7 +420,6 @@ def compute_line_height(font):
     gap_px = LINE_GAP_PT * PT_TO_PX * RENDER_SCALE
     return int(round(ascent + descent + gap_px))
 
-
 def fit_text_block(draw, full_text, font_path, initial_size, max_width, max_height, min_size=None):
     """Shrinks font until the full text wraps into a block that fits the
     available height. Floor defaults to a resolution-scaled 16pt, but a
@@ -697,23 +694,19 @@ def build_video(telugu_text, english_text, explanation_text):
         return render_video_frame(background, size, phases, t, stars)
 
     clip = VideoClip(make_frame, duration=VIDEO_DURATION).set_fps(FPS)
-
     chosen_music = pick_music_file()
-music_source = AudioFileClip(chosen_music)
-end_time = min(MUSIC_START_OFFSET + VIDEO_DURATION, music_source.duration)
-audio = music_source.subclip(MUSIC_START_OFFSET, end_time)
-clip = clip.set_audio(audio)
-output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
+                music_source = AudioFileClip(chosen_music)
+                end_time = min(MUSIC_START_OFFSET + VIDEO_DURATION, music_source.duration)
+                audio = music_source.subclip(MUSIC_START_OFFSET, end_time)
+                clip = clip.set_audio(audio)
+                output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
     # 4K needs a much higher bitrate than 720p to actually look sharp —
     # libx264 defaults would otherwise compress it down to mushy quality.
     clip.write_videofile(
-        output_path, fps=FPS, codec="libx264", audio_codec="aac",
-        bitrate="40M", preset="medium",
-        ffmpeg_params=["-pix_fmt", "yuv420p"],
-    )
+                        output_path, fps=FPS, codec="libx264", audio_codec="aac",
+                        bitrate="40M", preset="medium",
+                        ffmpeg_params=["-pix_fmt", "yuv420p"],    )
     return output_path
-
-
 def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     base_text = english_text or telugu_text
     title_source = re.sub(r"\([^()]*\)\s*$", "", base_text).strip()
