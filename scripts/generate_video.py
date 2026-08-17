@@ -739,11 +739,6 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
 def main():
     creds = get_user_credentials()
     sheets_service = get_sheets_service()
-    row_number = None
-    if TELUGU_OVERRIDE or ENGLISH_OVERRIDE:
-        ...
-def main():
-    sheets_service = get_sheets_service()
 
     row_number = None
     if TELUGU_OVERRIDE or ENGLISH_OVERRIDE:
