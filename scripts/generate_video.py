@@ -6,6 +6,9 @@ import re
 import math
 import random
 import colorsys
+import time
+from ssl import SSLError
+from http.client import IncompleteRead
 import unicodedata
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
@@ -131,7 +134,22 @@ ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
 
 def is_telugu(text):
     return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
+_PUNCT_MAP = {
+    "\u2018": "'", "\u2019": "'",   # curly single quotes -> straight
+    "\u201c": '"', "\u201d": '"',  # curly double quotes -> straight
+    "\u2013": "-", "\u2014": "-",  # en/em dash -> hyphen
+    "\u2026": "...",               # ellipsis character -> three dots
+}
 
+def sanitize_text(text):
+    """Some fonts (like our English Poppins font) are missing glyphs for
+    'smart' typographic punctuation, which renders as empty boxes. This
+    swaps those characters for plain ASCII equivalents before drawing."""
+    if text is None:
+        return text
+    for bad, good in _PUNCT_MAP.items():
+        text = text.replace(bad, good)
+    return text
 
 def extract_reference_tag(text):
     """Looks for a trailing '(Book Chapter:Verse)' style reference embedded in
@@ -391,9 +409,9 @@ def normalize_manual_breaks(text):
 
 def wrap_text(draw, text, font, max_width):
     """Wraps text to max_width. Any manual break ("\n") in the text always
-    starts a new line first — each segment between manual breaks is then
-    auto-wrapped independently by pixel width, so a break you place in the
-    sheet is never overridden by the automatic wrapping."""
+    starts a new line first. If a single word is itself wider than
+    max_width (common with long Telugu compound words), it's broken
+    character-by-character so it can never run off the edge of the frame."""
     text = normalize_manual_breaks(text)
     lines = []
     for segment in text.split("\n"):
@@ -403,11 +421,24 @@ def wrap_text(draw, text, font, max_width):
             test = f"{current} {word}".strip()
             if text_width(draw, test, font) <= max_width:
                 current = test
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            if text_width(draw, word, font) > max_width:
+                piece = ""
+                for ch in word:
+                    test_piece = piece + ch
+                    if text_width(draw, test_piece, font) <= max_width:
+                        piece = test_piece
+                    else:
+                        if piece:
+                            lines.append(piece)
+                        piece = ch
+                current = piece
             else:
-                if current:
-                    lines.append(current)
                 current = word
-        lines.append(current)  # keep even if blank, to preserve an intentional blank line
+        lines.append(current)
     return lines
 
 
@@ -532,12 +563,17 @@ def build_phase(text, style, size, column):
     max_width = size[0] - (TEXT_MARGIN_X * 2)
     max_height = size[1] - SAFE_TOP - SAFE_BOTTOM
 
-    # Note text (Column C) is usually longer than the verse, so it would
-    # otherwise auto-shrink much smaller than Column A/B just to fit. Give it
-    # a much higher floor — 80% of its starting size — so it stays visually
-    # close in size; if it truly can't fit at that floor it will slightly
-    # overflow rather than keep shrinking.
-    min_size = int(initial_size * 0.8) if style == "note" else None
+       # Note text (Column C): 10% smaller than the main verse text (per
+    # request), with a floor of 80% of that reduced size so it stays
+    # readable even when it can't fully fit.
+    if style == "note":
+        initial_size = int(initial_size * 0.9)
+        min_size = int(initial_size * 0.8)
+    else:
+        # Main verse text (Columns A/B) now has a real floor too, so a
+        # long English verse never shrinks to an unreadable size just
+        # because it has more words than the Telugu version.
+        min_size = int(initial_size * 0.55)
 
     probe_img = Image.new("RGB", size)
     probe_draw = ImageDraw.Draw(probe_img)
@@ -705,6 +741,18 @@ def build_video(telugu_text, english_text, explanation_text):
         ffmpeg_params=["-pix_fmt", "yuv420p"],
     )
     return output_path
+    def call_with_retries(func, max_retries=5, base_delay=5):
+    """Retries on dropped connections (common on GitHub Actions runners
+    talking to Google's servers) with increasing wait time between tries."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func()
+        except (SSLError, ConnectionError, IncompleteRead, TimeoutError) as e:
+            if attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"Network hiccup ({e}) — retrying in {delay}s (attempt {attempt}/{max_retries})...")
+            time.sleep(delay)
 def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     base_text = english_text or telugu_text
     title_source = re.sub(r"\([^()]*\)\s*$", "", base_text).strip()
@@ -730,8 +778,9 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     response = None
+        response = None
     while response is None:
-        status, response = request.next_chunk()
+        status, response = call_with_retries(lambda: request.next_chunk())
         if status:
             print(f"Upload progress: {int(status.progress() * 100)}%")
     print(f"Uploaded video ID: {response['id']} (privacy: {privacy})")
@@ -750,7 +799,9 @@ def main():
             print("No unused rows found in the sheet. Exiting.")
             sys.exit(0)
         print(f"Selected row {row_number} — Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
-
+    telugu_text = sanitize_text(telugu_text)
+    english_text = sanitize_text(english_text)
+    explanation_text = sanitize_text(explanation_text)
     video_path = build_video(telugu_text, english_text, explanation_text)
 
     youtube_service = get_youtube_service(creds)
