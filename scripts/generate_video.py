@@ -740,7 +740,7 @@ def build_video(telugu_text, english_text, explanation_text):
     output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
     clip.write_videofile(
         output_path, fps=FPS, codec="libx264", audio_codec="aac",
-        bitrate="40M", preset="medium",
+        bitrate="12M", preset="faster", threads=2,
         ffmpeg_params=["-pix_fmt", "yuv420p"],
     )
     return output_path
