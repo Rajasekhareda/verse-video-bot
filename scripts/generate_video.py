@@ -36,19 +36,14 @@ FONT_PATH_TELUGU = os.environ.get(
     "FONT_PATH_TELUGU", "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
 )
 
-# English text (Columns B and C) now uses Poppins instead of Noto Serif.
-# Poppins isn't a default system font, so it needs to actually be present —
-# download "Poppins-Bold.ttf" from Google Fonts and place it in your repo at
-# assets/fonts/Poppins-Bold.ttf (or point FONT_PATH_LATIN at wherever you put
-# it). If the file isn't found, this safely falls back to Noto Serif instead
-# of crashing the whole run.
-_FONT_PATH_LATIN_REQUESTED = os.environ.get("FONT_PATH_LATIN", "assets/fonts/Poppins-Bold.ttf")
-_FONT_PATH_LATIN_FALLBACK = "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
-if os.path.exists(_FONT_PATH_LATIN_REQUESTED):
-    FONT_PATH_LATIN = _FONT_PATH_LATIN_REQUESTED
-else:
-    print(f"Warning: font not found at '{_FONT_PATH_LATIN_REQUESTED}', falling back to Noto Serif.")
-    FONT_PATH_LATIN = _FONT_PATH_LATIN_FALLBACK
+# English text (Columns B and C) uses Noto Serif — the same family as the
+# Telugu font, so both scripts share one consistent, premium serif look
+# instead of mixing a serif and a geometric sans. It's installed by apt
+# (fonts-noto-core) in the workflow, so this never depends on a font file
+# actually being present in the repo.
+FONT_PATH_LATIN = os.environ.get(
+    "FONT_PATH_LATIN", "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
+)
 
 VIDEO_DURATION = 50           # ~50s — fits a single short verse on screen
 MUSIC_START_OFFSET = 10
@@ -77,8 +72,6 @@ SHADOW_OFFSET = int(4 * RENDER_SCALE)
 LINE_GAP_PT = 1.5               # fixed vertical gap between lines
 PT_TO_PX = 96 / 72               # standard 1pt = 1/72in at 96dpi, for on-screen video text
 
-SECONDS_PER_LINE = 2.5            # how long each single line holds on screen before the next one
-MAX_REVEAL_SECONDS = 10           # safety cap per phase's reveal window
 TEXT_MARGIN_X = int(130 * RENDER_SCALE)
 SAFE_TOP = int(110 * RENDER_SCALE)
 SAFE_BOTTOM = int(110 * RENDER_SCALE)
@@ -88,12 +81,6 @@ TRANSITION_SECONDS = 1.3   # how long each scroll-out/scroll-in transition takes
 # (VIDEO_DURATION / 45) so the per-column pacing stays the same as the
 # original 45-second build regardless of the actual VIDEO_DURATION.
 _BASE_COLUMN_DURATIONS = {"A": 15, "B": 12, "C": 18}
-
-# Every phase (Telugu, English, explanation) reveals one line at a time:
-# a line appears alone, holds for SECONDS_PER_LINE, crossfades out, and the
-# next line takes its place. This short crossfade is what makes the swap
-# look like a clean dissolve instead of an abrupt cut.
-LINE_CROSSFADE_SECONDS = 0.5
 
 NEON_BORDER_MARGIN = int(19 * RENDER_SCALE)
 NEON_BORDER_THICKNESS = int(4 * RENDER_SCALE)
@@ -669,10 +656,11 @@ def render_video_frame(background, size, phases, t, stars):
     tl = t - elapsed
     phase = phases[idx]
 
-    # A slow, gentle hue drift across the whole video's runtime — a few
-    # degrees back and forth, applied to every text draw below. Subtle by
-    # design: a living shimmer, not a flashy color change.
-    hue_drift = 8 * math.sin(2 * math.pi * t / VIDEO_DURATION)
+    # A very slow, gentle hue drift across the whole video's runtime — just
+    # a few degrees back and forth. This is the ONLY thing that moves once
+    # a phase's text is on screen; text position/opacity never changes
+    # mid-phase, so nothing competes with reading it.
+    hue_drift = 4 * math.sin(2 * math.pi * t / VIDEO_DURATION)
 
     in_transition = tl >= (phase_duration - TRANSITION_SECONDS) and idx < num_phases - 1
 
@@ -685,49 +673,15 @@ def render_video_frame(background, size, phases, t, stars):
         draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["colors"], hue_drift)
 
         next_phase = phases[idx + 1]
-        # If the incoming phase is paged (Column C), scroll in showing its
-        # first page/group only — not the entire unwrapped block.
-        next_lines = next_phase["units"][0] if next_phase.get("units") else next_phase["lines"]
+        next_lines = next_phase["lines"]
         in_offset = (1 - ease) * size[1]
         draw_text_block(img, draw, next_lines, next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"], hue_drift)
 
     else:
-        # Every phase cycles through its lines one at a time: a line
-        # appears alone, holds for its share of the phase's time, then the
-        # next line fades + rises smoothly into place while the old one
-        # fades out in place — the same "fade + rise" caption style used
-        # by CapCut/Premiere, chosen for being clean and unobtrusive
-        # rather than flashy. Timing for each line was precomputed in
-        # build_video (phase["unit_starts"] / phase["unit_durations"]).
-        units = phase["units"]
-        starts = phase["unit_starts"]
-        durations = phase["unit_durations"]
-        num_units = len(units)
-
-        uidx = num_units - 1
-        for i in range(num_units):
-            if tl < starts[i] + durations[i]:
-                uidx = i
-                break
-
-        local = tl - starts[uidx]
-        dur = durations[uidx]
-        fade = min(LINE_CROSSFADE_SECONDS, dur * 0.3)
-
-        if uidx > 0 and local < fade:
-            alpha = local / fade if fade > 0 else 1.0
-            ease = alpha * alpha * (3 - 2 * alpha)  # smoothstep, matches the phase-transition easing
-            rise_amount = phase["line_height"] * 0.4
-            prev_img = img.copy()
-            prev_draw = ImageDraw.Draw(prev_img)
-            draw_text_block(prev_img, prev_draw, units[uidx - 1], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift)
-            curr_img = img.copy()
-            curr_draw = ImageDraw.Draw(curr_img)
-            curr_rise_offset = int((1 - ease) * rise_amount)
-            draw_text_block(curr_img, curr_draw, units[uidx], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift, rise_offset=curr_rise_offset)
-            img = Image.blend(prev_img, curr_img, ease)
-        else:
-            draw_text_block(img, draw, units[uidx], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift)
+        # The phase's full text, as-is (wrapped normally, manual line
+        # breaks respected), held completely still for the rest of its
+        # duration. No cycling, no motion — just readable text.
+        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift)
 
     return np.array(img.convert("RGB"))
 
@@ -765,33 +719,11 @@ def build_video(telugu_text, english_text, explanation_text):
     for p in phases:
         p["duration"] = _BASE_COLUMN_DURATIONS[p["column"]] * scale
 
-    # Every phase — Telugu, English, and the explanation alike — cycles
-    # through its lines one at a time: each line gets SECONDS_PER_LINE to
-    # itself. If a phase's lines all fit comfortably within its time budget,
-    # the last line simply holds until the phase ends (no rushing, no dead
-    # air). If there are too many lines to give each its full share, time is
-    # split evenly across all of them instead of truncating the later ones.
-    for idx, p in enumerate(phases):
-        content_duration = p["duration"] - (TRANSITION_SECONDS if idx < len(phases) - 1 else 0)
-        content_duration = max(content_duration, 0.1)
-        units = [[line] for line in p["lines"]] or [[""]]
-        num_units = len(units)
-        base_durations = [SECONDS_PER_LINE] * num_units
-        total_needed = sum(base_durations)
-        if total_needed <= content_duration:
-            durations = base_durations[:]
-            durations[-1] += content_duration - total_needed  # last line holds till phase end
-        else:
-            scale = content_duration / total_needed
-            durations = [d * scale for d in base_durations]
-        starts = []
-        acc = 0.0
-        for d in durations:
-            starts.append(acc)
-            acc += d
-        p["units"] = units
-        p["unit_starts"] = starts
-        p["unit_durations"] = durations
+    # Each phase shows its FULL text at once (respecting normal word-wrap and
+    # any manual line breaks) for its entire duration, with no motion except
+    # the one slide+fade transition into the next phase. Reading a whole
+    # sentence takes reading it as a sentence, not as a sequence of
+    # individually-animated fragments.
 
     # Frames are rendered on demand by moviepy (one at a time) rather than all
     # built into a Python list up front. At 4K, holding every frame in memory
