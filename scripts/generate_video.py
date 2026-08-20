@@ -359,7 +359,9 @@ def get_youtube_service(creds):
 def fetch_next_row(service):
     """A = Telugu, B = English, C = optional explanation, D = 'used' marker."""
     range_ = f"{SHEET_TAB}!A2:D"
-    result = service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_).execute()
+    result = call_with_retries(
+        lambda: service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_).execute()
+    )
     rows = result.get("values", [])
     for i, row in enumerate(rows):
         telugu = row[0] if len(row) > 0 else ""
@@ -373,12 +375,12 @@ def fetch_next_row(service):
 
 
 def mark_row_used(service, row_number):
-    service.spreadsheets().values().update(
+    call_with_retries(lambda: service.spreadsheets().values().update(
         spreadsheetId=SHEET_ID,
         range=f"{SHEET_TAB}!D{row_number}",
         valueInputOption="RAW",
         body={"values": [["used"]]},
-    ).execute()
+    ).execute())
 
 
 # ---------------- text fitting + drawing ----------------
@@ -741,7 +743,9 @@ def build_video(telugu_text, english_text, explanation_text):
         ffmpeg_params=["-pix_fmt", "yuv420p"],
     )
     return output_path
-    def call_with_retries(func, max_retries=5, base_delay=5):
+
+
+def call_with_retries(func, max_retries=5, base_delay=5):
     """Retries on dropped connections (common on GitHub Actions runners
     talking to Google's servers) with increasing wait time between tries."""
     for attempt in range(1, max_retries + 1):
@@ -753,6 +757,8 @@ def build_video(telugu_text, english_text, explanation_text):
             delay = base_delay * (2 ** (attempt - 1))
             print(f"Network hiccup ({e}) — retrying in {delay}s (attempt {attempt}/{max_retries})...")
             time.sleep(delay)
+
+
 def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     base_text = english_text or telugu_text
     title_source = re.sub(r"\([^()]*\)\s*$", "", base_text).strip()
@@ -778,7 +784,6 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
     request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
     response = None
-        response = None
     while response is None:
         status, response = call_with_retries(lambda: request.next_chunk())
         if status:
