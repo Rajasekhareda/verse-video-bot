@@ -16,6 +16,7 @@ from moviepy.editor import VideoClip, AudioFileClip
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
 
 # ================= SHEET LAYOUT =================
 # Column A = Telugu verse text
@@ -747,10 +748,21 @@ def build_video(telugu_text, english_text, explanation_text):
 
 def call_with_retries(func, max_retries=5, base_delay=5):
     """Retries on dropped connections (common on GitHub Actions runners
-    talking to Google's servers) with increasing wait time between tries."""
+    talking to Google's servers) with increasing wait time between tries.
+    Also retries on transient HTTP errors from Google's API itself (503
+    'service unavailable', 500, 502, 504, and 429 rate-limit) — but NOT on
+    real errors like 403/404, which will never succeed on retry."""
+    RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
     for attempt in range(1, max_retries + 1):
         try:
             return func()
+        except HttpError as e:
+            status = e.resp.status if getattr(e, "resp", None) else None
+            if status not in RETRYABLE_HTTP_STATUSES or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"Google API returned {status} — retrying in {delay}s (attempt {attempt}/{max_retries})...")
+            time.sleep(delay)
         except (SSLError, ConnectionError, IncompleteRead, TimeoutError) as e:
             if attempt == max_retries:
                 raise
