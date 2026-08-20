@@ -77,7 +77,7 @@ SHADOW_OFFSET = int(4 * RENDER_SCALE)
 LINE_GAP_PT = 1.5               # fixed vertical gap between lines
 PT_TO_PX = 96 / 72               # standard 1pt = 1/72in at 96dpi, for on-screen video text
 
-SECONDS_PER_LINE = 2.5            # how long each fully-revealed line stays on screen
+SECONDS_PER_LINE = 2.5            # how long each single line holds on screen before the next one
 MAX_REVEAL_SECONDS = 10           # safety cap per phase's reveal window
 TEXT_MARGIN_X = int(130 * RENDER_SCALE)
 SAFE_TOP = int(110 * RENDER_SCALE)
@@ -89,11 +89,11 @@ TRANSITION_SECONDS = 1.3   # how long each scroll-out/scroll-in transition takes
 # original 45-second build regardless of the actual VIDEO_DURATION.
 _BASE_COLUMN_DURATIONS = {"A": 15, "B": 12, "C": 18}
 
-# Column C often has many lines. Rather than shrinking the font tiny to cram
-# them all in at once, it's split into readable groups shown one at a time
-# within its own time budget, at roughly this many seconds per group.
-NOTE_SECONDS_PER_PAGE = 5
-NOTE_PAGE_CROSSFADE_SECONDS = 0.5
+# Every phase (Telugu, English, explanation) reveals one line at a time:
+# a line appears alone, holds for SECONDS_PER_LINE, crossfades out, and the
+# next line takes its place. This short crossfade is what makes the swap
+# look like a clean dissolve instead of an abrupt cut.
+LINE_CROSSFADE_SECONDS = 0.5
 
 NEON_BORDER_MARGIN = int(19 * RENDER_SCALE)
 NEON_BORDER_THICKNESS = int(4 * RENDER_SCALE)
@@ -140,17 +140,45 @@ _PUNCT_MAP = {
     "\u201c": '"', "\u201d": '"',  # curly double quotes -> straight
     "\u2013": "-", "\u2014": "-",  # en/em dash -> hyphen
     "\u2026": "...",               # ellipsis character -> three dots
+    "\u2022": "-", "\u25cf": "-", "\u2023": "-",   # bullets -> hyphen
+    "\u2020": "*", "\u2021": "*",  # dagger / double dagger -> asterisk (footnote-style)
+    "\u00a7": "Sec.",              # section sign
+    "\u00b6": "",                  # pilcrow -> drop
+    "\u2212": "-",                 # minus sign -> hyphen
+    "\u00d7": "x",                 # multiplication sign
+    "\u00f7": "/",                 # division sign
+    "\u00b0": " deg",              # degree sign
+    "\u00ab": '"', "\u00bb": '"',  # guillemets -> straight quotes
+    "\u00a0": " ", "\u2002": " ", "\u2003": " ", "\u2009": " ", "\u200a": " ",  # assorted spaces -> normal space
+    "\u200b": "", "\u200c": "", "\u200d": "", "\ufeff": "",  # zero-width chars -> drop
 }
 
 def sanitize_text(text):
-    """Some fonts (like our English Poppins font) are missing glyphs for
-    'smart' typographic punctuation, which renders as empty boxes. This
-    swaps those characters for plain ASCII equivalents before drawing."""
+    """Guarantees every character that reaches the renderer is one the
+    fonts can actually draw, so a missing glyph can never show up as an
+    empty box. First swaps common 'smart' typographic marks for safe
+    plain-ASCII equivalents via the curated map above. Anything still left
+    over that isn't plain ASCII and isn't Telugu script gets a second
+    pass: strip accents where possible (e.g. 'cafe' stays readable instead
+    of a boxed e-with-accent), and if a character still can't be
+    represented, it's dropped rather than ever rendered as a box."""
     if text is None:
         return text
     for bad, good in _PUNCT_MAP.items():
         text = text.replace(bad, good)
-    return text
+
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch in "\n\t" or 0x20 <= code <= 0x7e:   # plain ASCII / basic whitespace
+            out.append(ch)
+        elif 0x0c00 <= code <= 0x0c7f:              # Telugu block — always keep as-is
+            out.append(ch)
+        else:
+            decomposed = unicodedata.normalize("NFKD", ch)
+            base = "".join(c for c in decomposed if not unicodedata.combining(c) and 0x20 <= ord(c) <= 0x7e)
+            out.append(base)  # may be "" if nothing safe survives — dropped, never boxed
+    return "".join(out)
 
 def extract_reference_tag(text):
     """Looks for a trailing '(Book Chapter:Verse)' style reference embedded in
@@ -459,10 +487,12 @@ def fit_text_block(draw, full_text, font_path, initial_size, max_width, max_heig
     available height. Floor defaults to a resolution-scaled 16pt, but a
     phase can pass a higher min_size (e.g. Column C's note text) so long
     text doesn't shrink far more than the main verse just because it has
-    more words. If it still doesn't fit at the floor, it renders at the
-    floor anyway (slight overflow) rather than shrinking further."""
+    more words. If it still doesn't fit at that floor, it keeps shrinking
+    past it down to a true hard minimum — text should essentially never
+    get visually cut off, even for unusually long input."""
     size = initial_size
     absolute_floor = min_size if min_size is not None else max(16, int(16 * RENDER_SCALE))
+    hard_floor = max(10, int(10 * RENDER_SCALE))
     while size >= absolute_floor:
         font = ImageFont.truetype(font_path, size)
         lines = wrap_text(draw, full_text, font, max_width)
@@ -470,7 +500,15 @@ def fit_text_block(draw, full_text, font_path, initial_size, max_width, max_heig
         if len(lines) * line_height <= max_height:
             return font, lines, line_height
         size -= 2
-    font = ImageFont.truetype(font_path, absolute_floor)
+    size = absolute_floor - 2
+    while size >= hard_floor:
+        font = ImageFont.truetype(font_path, size)
+        lines = wrap_text(draw, full_text, font, max_width)
+        line_height = compute_line_height(font)
+        if len(lines) * line_height <= max_height:
+            return font, lines, line_height
+        size -= 2
+    font = ImageFont.truetype(font_path, hard_floor)
     lines = wrap_text(draw, full_text, font, max_width)
     return font, lines, compute_line_height(font)
 
@@ -485,7 +523,18 @@ def make_vertical_gradient(size, color_top, color_bottom):
     return Image.fromarray(grad, mode="RGB")
 
 
-def draw_cinematic_text(img, draw, text, font, x, y, fill_top, fill_bottom, outlay_fill, inner_edge, block_top, block_height):
+def shift_hue(rgb, degrees):
+    """Rotates an RGB color's hue by a number of degrees, keeping its
+    lightness/saturation — used for a slow, subtle color drift on the
+    text fill so it feels alive without ever looking flashy."""
+    r, g, b = [c / 255 for c in rgb]
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    h = (h + degrees / 360.0) % 1.0
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+    return (int(r2 * 255), int(g2 * 255), int(b2 * 255))
+
+
+def draw_cinematic_text(img, draw, text, font, x, y, fill_top, fill_bottom, outlay_fill, inner_edge, block_top, block_height, hue_shift_deg=0.0):
     """Cinematic text: drop shadow -> thick solid outlay border -> a
     vertical-gradient inlay fill clipped to the glyph shapes -> a thin
     crisp inner edge on top for definition.
@@ -493,7 +542,15 @@ def draw_cinematic_text(img, draw, text, font, x, y, fill_top, fill_bottom, outl
     block_top / block_height define the vertical span of the WHOLE text block
     so the gradient runs from fill_top at the first line to fill_bottom at the
     last — making the color shift clearly visible rather than landing on one
-    washed-out mid-point of a full-frame gradient."""
+    washed-out mid-point of a full-frame gradient.
+
+    hue_shift_deg rotates only the gold FILL (not the outlay border or inner
+    edge, which stay fixed for consistent contrast/legibility) — a slow drift
+    of a few degrees over the whole video gives the text a subtle living
+    shimmer rather than a static flat color."""
+    if hue_shift_deg:
+        fill_top = shift_hue(fill_top, hue_shift_deg)
+        fill_bottom = shift_hue(fill_bottom, hue_shift_deg)
     # drop shadow
     draw.text((x + SHADOW_OFFSET, y + SHADOW_OFFSET), text, font=font, fill=(0, 0, 0))
 
@@ -528,17 +585,17 @@ def draw_cinematic_text(img, draw, text, font, x, y, fill_top, fill_bottom, outl
     img.paste(gradient, (0, 0), mask_img)
 
 
-def draw_text_block(img, draw, lines, font, line_height, size, y_offset, colors):
+def draw_text_block(img, draw, lines, font, line_height, size, y_offset, colors, hue_shift_deg=0.0, rise_offset=0):
     fill_top, fill_bottom, outlay_fill, inner_edge = colors
     total_height = len(lines) * line_height
     block_top = int((size[1] - total_height) // 2 - 40 + y_offset)
-    y = block_top
+    y = block_top + rise_offset
     for line in lines:
         w = text_width(draw, line, font)
         x = max(TEXT_MARGIN_X, (size[0] - w) // 2)
         draw_cinematic_text(img, draw, line, font, x, y,
                             fill_top, fill_bottom, outlay_fill, inner_edge,
-                            block_top, total_height)
+                            block_top, total_height, hue_shift_deg)
         y += line_height
 
 
@@ -612,8 +669,12 @@ def render_video_frame(background, size, phases, t, stars):
     tl = t - elapsed
     phase = phases[idx]
 
+    # A slow, gentle hue drift across the whole video's runtime — a few
+    # degrees back and forth, applied to every text draw below. Subtle by
+    # design: a living shimmer, not a flashy color change.
+    hue_drift = 8 * math.sin(2 * math.pi * t / VIDEO_DURATION)
+
     in_transition = tl >= (phase_duration - TRANSITION_SECONDS) and idx < num_phases - 1
-    reveal_duration = phase.get("reveal_duration", 0)
 
     if in_transition:
         progress = (tl - (phase_duration - TRANSITION_SECONDS)) / TRANSITION_SECONDS
@@ -621,51 +682,52 @@ def render_video_frame(background, size, phases, t, stars):
         ease = progress * progress * (3 - 2 * progress)  # smoothstep
 
         out_offset = -ease * (size[1])
-        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["colors"])
+        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, out_offset, phase["colors"], hue_drift)
 
         next_phase = phases[idx + 1]
         # If the incoming phase is paged (Column C), scroll in showing its
         # first page/group only — not the entire unwrapped block.
-        next_lines = next_phase["pages"][0] if "pages" in next_phase else next_phase["lines"]
+        next_lines = next_phase["units"][0] if next_phase.get("units") else next_phase["lines"]
         in_offset = (1 - ease) * size[1]
-        draw_text_block(img, draw, next_lines, next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"])
-
-    elif idx == 0 and tl < reveal_duration:
-        # Line-by-line reveal: each fully-formed line of the phase is shown
-        # one at a time, dwelling for SECONDS_PER_LINE before the next line
-        # joins it. We rebuild the wrap from the visible-prefix text so each
-        # line drops in already wrapped at the same width the final block
-        # uses — no reflow jump when the last line arrives.
-        all_lines = phase["lines"]
-        progress = tl / reveal_duration if reveal_duration > 0 else 1.0
-        n_to_show = min(len(all_lines), max(1, int(progress * len(all_lines)) + 1))
-        visible_lines = all_lines[:n_to_show]
-        draw_text_block(img, draw, visible_lines, phase["font"], phase["line_height"], size, 0, phase["colors"])
-
-    elif "pages" in phase:
-        # Column C: cycle through its grouped lines sequentially within its
-        # own time budget, with a short crossfade between groups.
-        pages = phase["pages"]
-        page_duration = phase["page_duration"]
-        num_pages = len(pages)
-        page_idx = min(int(tl // page_duration), num_pages - 1)
-        local = tl - page_idx * page_duration
-        crossfade = min(NOTE_PAGE_CROSSFADE_SECONDS, page_duration * 0.3)
-
-        if page_idx > 0 and local < crossfade:
-            alpha = local / crossfade if crossfade > 0 else 1.0
-            prev_img = img.copy()
-            prev_draw = ImageDraw.Draw(prev_img)
-            draw_text_block(prev_img, prev_draw, pages[page_idx - 1], phase["font"], phase["line_height"], size, 0, phase["colors"])
-            curr_img = img.copy()
-            curr_draw = ImageDraw.Draw(curr_img)
-            draw_text_block(curr_img, curr_draw, pages[page_idx], phase["font"], phase["line_height"], size, 0, phase["colors"])
-            img = Image.blend(prev_img, curr_img, alpha)
-        else:
-            draw_text_block(img, draw, pages[page_idx], phase["font"], phase["line_height"], size, 0, phase["colors"])
+        draw_text_block(img, draw, next_lines, next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"], hue_drift)
 
     else:
-        draw_text_block(img, draw, phase["lines"], phase["font"], phase["line_height"], size, 0, phase["colors"])
+        # Every phase cycles through its lines one at a time: a line
+        # appears alone, holds for its share of the phase's time, then the
+        # next line fades + rises smoothly into place while the old one
+        # fades out in place — the same "fade + rise" caption style used
+        # by CapCut/Premiere, chosen for being clean and unobtrusive
+        # rather than flashy. Timing for each line was precomputed in
+        # build_video (phase["unit_starts"] / phase["unit_durations"]).
+        units = phase["units"]
+        starts = phase["unit_starts"]
+        durations = phase["unit_durations"]
+        num_units = len(units)
+
+        uidx = num_units - 1
+        for i in range(num_units):
+            if tl < starts[i] + durations[i]:
+                uidx = i
+                break
+
+        local = tl - starts[uidx]
+        dur = durations[uidx]
+        fade = min(LINE_CROSSFADE_SECONDS, dur * 0.3)
+
+        if uidx > 0 and local < fade:
+            alpha = local / fade if fade > 0 else 1.0
+            ease = alpha * alpha * (3 - 2 * alpha)  # smoothstep, matches the phase-transition easing
+            rise_amount = phase["line_height"] * 0.4
+            prev_img = img.copy()
+            prev_draw = ImageDraw.Draw(prev_img)
+            draw_text_block(prev_img, prev_draw, units[uidx - 1], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift)
+            curr_img = img.copy()
+            curr_draw = ImageDraw.Draw(curr_img)
+            curr_rise_offset = int((1 - ease) * rise_amount)
+            draw_text_block(curr_img, curr_draw, units[uidx], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift, rise_offset=curr_rise_offset)
+            img = Image.blend(prev_img, curr_img, ease)
+        else:
+            draw_text_block(img, draw, units[uidx], phase["font"], phase["line_height"], size, 0, phase["colors"], hue_drift)
 
     return np.array(img.convert("RGB"))
 
@@ -703,27 +765,33 @@ def build_video(telugu_text, english_text, explanation_text):
     for p in phases:
         p["duration"] = _BASE_COLUMN_DURATIONS[p["column"]] * scale
 
-    # The first phase reveals its text line-by-line. The reveal window is
-    # one line per SECONDS_PER_LINE, scaled to a comfortable fraction of
-    # the phase's own duration (no word-count cap) — long verses simply
-    # take longer to reveal, which is what we want.
-    n_lines_first = max(1, len(phases[0]["lines"]))
-    line_based = n_lines_first * SECONDS_PER_LINE
-    phases[0]["reveal_duration"] = min(line_based, phases[0]["duration"] - TRANSITION_SECONDS)
-
-    # Column C (the note/explanation) often has many lines. Rather than
-    # cramming them all into one shrunken block, group them into readable
-    # "pages" shown sequentially within Column C's own time budget.
-    for p in phases:
-        if p["column"] != "C":
-            continue
-        total_lines = len(p["lines"])
-        target_pages = max(1, round(p["duration"] / NOTE_SECONDS_PER_PAGE))
-        num_pages = max(1, min(target_pages, total_lines))
-        lines_per_page = math.ceil(total_lines / num_pages) if total_lines else 1
-        pages = [p["lines"][i:i + lines_per_page] for i in range(0, total_lines, lines_per_page)] or [[]]
-        p["pages"] = pages
-        p["page_duration"] = p["duration"] / len(pages)
+    # Every phase — Telugu, English, and the explanation alike — cycles
+    # through its lines one at a time: each line gets SECONDS_PER_LINE to
+    # itself. If a phase's lines all fit comfortably within its time budget,
+    # the last line simply holds until the phase ends (no rushing, no dead
+    # air). If there are too many lines to give each its full share, time is
+    # split evenly across all of them instead of truncating the later ones.
+    for idx, p in enumerate(phases):
+        content_duration = p["duration"] - (TRANSITION_SECONDS if idx < len(phases) - 1 else 0)
+        content_duration = max(content_duration, 0.1)
+        units = [[line] for line in p["lines"]] or [[""]]
+        num_units = len(units)
+        base_durations = [SECONDS_PER_LINE] * num_units
+        total_needed = sum(base_durations)
+        if total_needed <= content_duration:
+            durations = base_durations[:]
+            durations[-1] += content_duration - total_needed  # last line holds till phase end
+        else:
+            scale = content_duration / total_needed
+            durations = [d * scale for d in base_durations]
+        starts = []
+        acc = 0.0
+        for d in durations:
+            starts.append(acc)
+            acc += d
+        p["units"] = units
+        p["unit_starts"] = starts
+        p["unit_durations"] = durations
 
     # Frames are rendered on demand by moviepy (one at a time) rather than all
     # built into a Python list up front. At 4K, holding every frame in memory
