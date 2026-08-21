@@ -58,8 +58,12 @@ RENDER_SCALE = VIDEO_SIZE[0] / 1280
 # Telugu glyphs render visibly taller than Latin ones at the same point size.
 # Sizes bumped up significantly from the previous 72pt/54pt baseline so the
 # verse fills the frame much more at 4K and stays easy to read.
-MAIN_FONT_SIZE_LATIN = int(140 * RENDER_SCALE)
-MAIN_FONT_SIZE_TELUGU = int(105 * RENDER_SCALE)
+# FONT_SIZE_BUMP applies a further +15% on top of that baseline, across every
+# column — Column C (the "note" style) derives its size from these two
+# constants too, so it scales up proportionally along with A/B.
+FONT_SIZE_BUMP = 1.15
+MAIN_FONT_SIZE_LATIN = int(140 * FONT_SIZE_BUMP * RENDER_SCALE)
+MAIN_FONT_SIZE_TELUGU = int(105 * FONT_SIZE_BUMP * RENDER_SCALE)
 
 STROKE_WIDTH = int(3 * RENDER_SCALE)
 OUTLAY_STROKE_WIDTH = int(9 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
@@ -373,21 +377,32 @@ def get_youtube_service(creds):
 
 
 def fetch_next_row(service):
-    """A = Telugu, B = English, C = optional explanation, D = 'used' marker."""
+    """A = Telugu, B = English, C = optional explanation, D = 'used' marker.
+
+    Picks uniformly at random among ALL rows not yet marked 'used', instead
+    of always the first one found. The old version returned the first
+    unmarked row top-to-bottom, which just crawls toward the bottom of the
+    sheet over many runs and looks like it's "always picking the last row"
+    once everything above is used up. This version considers every eligible
+    row each time and picks one at random."""
     range_ = f"{SHEET_TAB}!A2:D"
     result = call_with_retries(
         lambda: service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_).execute()
     )
     rows = result.get("values", [])
+    available = []
     for i, row in enumerate(rows):
         telugu = row[0] if len(row) > 0 else ""
         english = row[1] if len(row) > 1 else ""
         explanation = row[2] if len(row) > 2 else ""
         used = row[3] if len(row) > 3 else ""
         if (telugu or english) and used.strip().lower() != "used":
-            row_number = i + 2
-            return row_number, telugu.strip(), english.strip(), explanation.strip()
-    return None, None, None, None
+            available.append((i + 2, telugu.strip(), english.strip(), explanation.strip()))
+
+    print(f"{len(available)} unused row(s) available out of {len(rows)} total sheet row(s).")
+    if not available:
+        return None, None, None, None
+    return random.choice(available)
 
 
 def mark_row_used(service, row_number):
@@ -397,6 +412,7 @@ def mark_row_used(service, row_number):
         valueInputOption="RAW",
         body={"values": [["used"]]},
     ).execute())
+    print(f"Marked row {row_number}, Column D as 'used'.")
 
 
 # ---------------- text fitting + drawing ----------------
