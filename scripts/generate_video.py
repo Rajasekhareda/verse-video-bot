@@ -31,18 +31,29 @@ SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
 CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
 
-# Cinematic serif fonts — Telugu script needs its own font file.
+# Cinematic serif fonts.
+#
+# IMPORTANT: both paths point to the SAME merged font file
+# (assets/fonts/NotoSerifMerged-Bold.ttf), built by combining Google's
+# NotoSerif-Bold.ttf (Latin) and NotoSerifTelugu-Bold.ttf (Telugu) with
+# fontTools' merge tool. This is deliberate, not a mistake.
+#
+# Root cause of the "English text renders as boxes" bug: NotoSerifTelugu-Bold
+# has ZERO glyphs for plain Latin letters (A-Z, a-z). Any row whose Telugu
+# text also contains English (a verse reference, "(KJV)", etc.) got detected
+# as Telugu by is_telugu() and rendered entirely in the Telugu font — which
+# then had no glyph to draw for any of the English letters, hence boxes.
+# Using one merged font for both branches means a single text block can
+# freely mix Telugu and English and every character will have a real glyph,
+# regardless of which "is_telugu" branch picked it.
 FONT_PATH_TELUGU = os.environ.get(
-    "FONT_PATH_TELUGU", "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
+    "FONT_PATH_TELUGU", "assets/fonts/NotoSerifMerged-Bold.ttf"
 )
 
-# English text (Columns B and C) uses Noto Serif — the same family as the
-# Telugu font, so both scripts share one consistent, premium serif look
-# instead of mixing a serif and a geometric sans. It's installed by apt
-# (fonts-noto-core) in the workflow, so this never depends on a font file
-# actually being present in the repo.
+# English text (Columns B and C) uses the same merged font as above, for the
+# same mixed-script reason — see the comment on FONT_PATH_TELUGU.
 FONT_PATH_LATIN = os.environ.get(
-    "FONT_PATH_LATIN", "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
+    "FONT_PATH_LATIN", "assets/fonts/NotoSerifMerged-Bold.ttf"
 )
 
 VIDEO_DURATION = 50           # ~50s — fits a single short verse on screen
