@@ -33,10 +33,10 @@ CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
 
 # Cinematic serif fonts.
 #
-# IMPORTANT: both paths point to the SAME merged font file
-# (assets/fonts/NotoSerifMerged-Bold.ttf), built by combining Google's
-# NotoSerif-Bold.ttf (Latin) and NotoSerifTelugu-Bold.ttf (Telugu) with
-# fontTools' merge tool. This is deliberate, not a mistake.
+# IMPORTANT: both paths point to the SAME merged font, built automatically
+# below by combining the system-installed NotoSerif-Bold.ttf (Latin) and
+# NotoSerifTelugu-Bold.ttf (Telugu) into one file with fontTools. This is
+# deliberate, not a mistake.
 #
 # Root cause of the "English text renders as boxes" bug: NotoSerifTelugu-Bold
 # has ZERO glyphs for plain Latin letters (A-Z, a-z). Any row whose Telugu
@@ -46,15 +46,25 @@ CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
 # Using one merged font for both branches means a single text block can
 # freely mix Telugu and English and every character will have a real glyph,
 # regardless of which "is_telugu" branch picked it.
-FONT_PATH_TELUGU = os.environ.get(
-    "FONT_PATH_TELUGU", "assets/fonts/NotoSerifMerged-Bold.ttf"
-)
+#
+# The merge runs once per workflow run (fresh each time, since GitHub
+# Actions gives a clean VM) and is cached to /tmp — no font file needs to
+# live in the repo or be uploaded by hand, which was error-prone on mobile.
+def _build_merged_font():
+    cache_path = "/tmp/NotoSerifMerged-Bold.ttf"
+    if os.path.exists(cache_path):
+        return cache_path
+    latin_src = "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
+    telugu_src = "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
+    from fontTools.merge import Merger
+    merged = Merger().merge([latin_src, telugu_src])
+    merged.save(cache_path)
+    return cache_path
 
-# English text (Columns B and C) uses the same merged font as above, for the
-# same mixed-script reason — see the comment on FONT_PATH_TELUGU.
-FONT_PATH_LATIN = os.environ.get(
-    "FONT_PATH_LATIN", "assets/fonts/NotoSerifMerged-Bold.ttf"
-)
+
+_MERGED_FONT_PATH = os.environ.get("MERGED_FONT_PATH") or _build_merged_font()
+FONT_PATH_TELUGU = os.environ.get("FONT_PATH_TELUGU", _MERGED_FONT_PATH)
+FONT_PATH_LATIN = os.environ.get("FONT_PATH_LATIN", _MERGED_FONT_PATH)
 
 VIDEO_DURATION = 50           # ~50s — fits a single short verse on screen
 MUSIC_START_OFFSET = 10
