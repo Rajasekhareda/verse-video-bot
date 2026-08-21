@@ -4,3 +4,4 @@ google-auth-oauthlib
 Pillow
 numpy
 moviepy==1.0.3
+fonttools
