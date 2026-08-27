@@ -86,4 +86,4 @@ jobs:
           TELUGU_OVERRIDE: ${{ inputs.telugu_override || '' }}
           ENGLISH_OVERRIDE: ${{ inputs.english_override || '' }}
           EXPLANATION_OVERRIDE: ${{ inputs.explanation_override || '' }}
-        run: python scripts/generate_video_fast.py
+        run: python scripts/generate_video_fixed.py
