@@ -1,0 +1,629 @@
+from google.oauth2 import service_account
+import json
+import os
+import sys
+import re
+import math
+import random
+import colorsys
+import time
+from ssl import SSLError
+from http.client import IncompleteRead
+import unicodedata
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from moviepy.editor import VideoClip, AudioFileClip, ImageClip, CompositeVideoClip
+from google.oauth2.credentials import Credentials as UserCredentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from googleapiclient.errors import HttpError
+
+# ================= SHEET LAYOUT =================
+# Column A = Telugu verse text
+# Column B = English verse text
+# Column C = optional brief explanation/note (English or Telugu) — leave blank if none
+# Column D = "used" marker, written automatically by this script
+# ==================================================
+
+SHEET_ID = os.environ["SHEET_ID"]
+SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
+
+MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
+CUSTOM_BG_DIR = os.environ.get("CUSTOM_BG_DIR", "assets/backgrounds")
+
+OUTPUT_DIR = "output"
+THUMBNAIL_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
+
+# Video settings - 4K UHD
+FPS = 24
+VIDEO_SIZE = (3840, 2160)  # 4K UHD
+MIN_DISPLAY_TIME = 5.0  # Minimum 5 seconds per text
+MAX_DISPLAY_TIME = 6.0  # Maximum 6 seconds per text
+WORDS_PER_SECOND = 0.4  # Slow reading pace for contemplation (2.5 words per second)
+
+# Font settings - Cinematic neon style
+FONT_PATH_TELUGU = "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf"
+FONT_PATH_LATIN = "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf"
+
+# Neon colors
+NEON_COLORS = [
+    (0, 255, 255),    # Cyan
+    (255, 0, 255),    # Magenta
+    (0, 255, 127),    # Spring green
+    (255, 20, 147),   # Deep pink
+    (30, 144, 255),   # Dodger blue
+    (255, 69, 0),     # Orange red
+    (138, 43, 226),   # Blue violet
+    (255, 105, 180),  # Hot pink
+]
+
+# Manual-run controls
+PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private").strip().lower()
+MUSIC_CHOICE = os.environ.get("MUSIC_CHOICE", "random").strip()
+BACKGROUND_THEME = os.environ.get("BACKGROUND_THEME", "random").strip()
+INCLUDE_EXPLANATION = os.environ.get("INCLUDE_EXPLANATION", "Auto").strip().lower()
+TELUGU_OVERRIDE = os.environ.get("TELUGU_OVERRIDE", "").strip()
+ENGLISH_OVERRIDE = os.environ.get("ENGLISH_OVERRIDE", "").strip()
+EXPLANATION_OVERRIDE = os.environ.get("EXPLANATION_OVERRIDE", "").strip()
+
+# ===================================================
+
+GRADIENT_PALETTES = {
+    "Midnight Purple":  ((18, 12, 52),  (72, 22, 100)),   # deep royal purple
+    "Ocean Blue":       ((8,  30, 70),  (20, 75, 130)),   # deep navy to sapphire
+    "Wine Red":         ((45, 8,  20),  (110, 25, 50)),   # dark burgundy to ruby
+    "Emerald Teal":     ((8,  42, 38),  (18, 100, 82)),   # dark forest to teal
+    "Sunset Amber":     ((50, 22, 8),   (140, 65, 18)),   # dark copper to amber
+    "Indigo Violet":    ((22, 14, 58),  (70, 45, 155)),   # deep indigo to violet
+    "Midnight Slate":   ((14, 20, 38),  (28, 45, 80)),    # near-black to slate blue
+    "Magenta Plum":     ((40, 10, 48),  (110, 22, 95)),   # deep plum to magenta
+}
+
+BASE_HASHTAGS = ["#BibleVerse", "#DailyVerse", "#Faith", "#God", "#Jesus", "#Scripture"]
+TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#Telugu"]
+ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
+
+def is_telugu(text):
+    return any("ఀ" <= ch <= "౿" for ch in text)
+
+_PUNCT_MAP = {
+    "‘": "'", "’": "'",   # curly single quotes -> straight
+    "“": '"', "”": '"',  # curly double quotes -> straight
+    "–": "-", "—": "-",  # en/em dash -> hyphen
+    "…": "...",               # ellipsis character -> three dots
+    "•": "-", "●": "-", "‣": "-",   # bullets -> hyphen
+    "†": "*", "‡": "*",  # dagger / double dagger -> asterisk (footnote-style)
+    "§": "Sec.",              # section sign
+    "¶": "",                  # pilcrow -> drop
+    "−": "-",                 # minus sign -> hyphen
+    "×": "x",                 # multiplication sign
+    "÷": "/",                 # division sign
+    "°": " deg",              # degree sign
+    "«": '"', "»": '"',  # guillemets -> straight quotes
+    " ": " ", " ": " ", " ": " ", " ": " ", " ": " ",  # assorted spaces -> normal space
+    "​": "", "‌": "", "‍": "", "﻿": "",  # zero-width chars -> drop
+}
+
+def sanitize_text(text):
+    if text is None:
+        return text
+    for bad, good in _PUNCT_MAP.items():
+        text = text.replace(bad, good)
+
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch in "\n\t" or 0x20 <= code <= 0x7e:   # plain ASCII / basic whitespace
+            out.append(ch)
+        elif 0x0c00 <= code <= 0x0c7f:              # Telugu block — always keep as-is
+            out.append(ch)
+        else:
+            decomposed = unicodedata.normalize("NFKD", ch)
+            base = "".join(c for c in decomposed if not unicodedata.combining(c) and 0x20 <= ord(c) <= 0x7e)
+            out.append(base)  # may be "" if nothing safe survives — dropped, never boxed
+    return "".join(out)
+
+def extract_reference_tag(text):
+    match = re.search(r"\(([^()]+)\)\s*$", text.strip())
+    if not match:
+        return None
+    inner = match.group(1).strip()
+    first_word = inner.split()[0] if inner.split() else None
+    return first_word
+
+def count_words(text):
+    """Count actual words in text, handling both English and Telugu"""
+    if not text:
+        return 0
+    # Split by spaces and punctuation, filter empty strings
+    words = re.findall(r'\b\w+\b', text)
+    return len(words)
+
+def calculate_display_duration(text):
+    """Calculate display time based on word count for proper reading pace"""
+    word_count = count_words(text)
+    # Base time: minimum 5 seconds + additional time based on word count
+    base_time = MIN_DISPLAY_TIME
+    # Add time for words: aim for 2-3 seconds per word for contemplative reading
+    word_time = word_count * (MAX_DISPLAY_TIME - MIN_DISPLAY_TIME) / 20  # Scale appropriately
+    # Ensure we don't exceed maximum reasonable time
+    total_time = base_time + word_time
+    return max(MIN_DISPLAY_TIME, min(total_time, MAX_DISPLAY_TIME * 2))  # Cap at 2x max for very long verses
+
+def generate_hashtags(telugu_text, english_text):
+    tags = list(BASE_HASHTAGS)
+    tags += TELUGU_HASHTAGS if is_telugu(telugu_text) else []
+    tags += ENGLISH_HASHTAGS if english_text else []
+
+    for source in (english_text, telugu_text):
+        tag_word = extract_reference_tag(source or "")
+        if tag_word:
+            cleaned = "".join(
+                ch for ch in tag_word if not unicodedata.category(ch).startswith(("P", "Z", "C", "N"))
+            )
+            book_tag = "#" + cleaned
+            if book_tag != "#" and book_tag not in tags:
+                tags.append(book_tag)
+            break
+
+    return tags[:10]
+
+def hue_to_rgb(hue):
+    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, 1.0, 1.0)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+def create_neon_text_layer(text, font_path, font_size, color, glow_intensity=2.0, pulse_phase=0):
+    """Create a cinematic neon text layer with glow effects"""
+    # Create a larger canvas to accommodate glow
+    padding = int(100 * glow_intensity)
+    temp_size = (VIDEO_SIZE[0] + padding * 2, VIDEO_SIZE[1] + padding * 2)
+
+    img = Image.new("RGBA", temp_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype(font_path, font_size)
+    except:
+        # Fallback to default if font not found
+        font = ImageFont.load_default()
+
+    # Calculate text position to center it
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    x = (temp_size[0] - text_width) // 2
+    y = (temp_size[1] - text_height) // 2
+
+    # Pulsing effect
+    pulse = 0.5 + 0.5 * math.sin(pulse_phase)
+    glow_radius = int(20 * glow_intensity * (0.7 + 0.3 * pulse))
+
+    # Draw multiple layers for glow effect
+    for i in range(glow_radius, 0, -2):
+        alpha = int(30 * (i / glow_radius) * pulse)
+        glow_color = (*color, alpha)
+        # Draw text with offset for glow
+        for dx in range(-i, i+1):
+            for dy in range(-i, i+1):
+                if dx*dx + dy*dy <= i*i:
+                    draw.text((x + dx, y + dy), text, font=font, fill=glow_color)
+
+    # Draw main text
+    draw.text((x, y), text, font=font, fill=(*color, 255))
+
+    # Crop back to original size
+    img = img.crop((padding, padding, padding + VIDEO_SIZE[0], padding + VIDEO_SIZE[1]))
+    return img
+
+def create_text_frame(telugu_text="", english_text="", explanation="", t=0, total_duration=0):
+    """Create a single frame with professional text layout"""
+    # Create background
+    bg_img = create_background()
+
+    # If we have both Telugu and English, display them together
+    if telugu_text and english_text:
+        # Create combined text with proper spacing
+        combined_text = f"{telugu_text}\n\n{english_text}"
+        text_layers = [
+            {"text": combined_text, "font_path": FONT_PATH_TELUGU, "is_mixed": True}
+        ]
+    elif telugu_text:
+        text_layers = [{"text": telugu_text, "font_path": FONT_PATH_TELUGU, "is_mixed": False}]
+    elif english_text:
+        text_layers = [{"text": english_text, "font_path": FONT_PATH_LATIN, "is_mixed": False}]
+    else:
+        text_layers = []
+
+    if not text_layers:
+        return np.array(bg_img.convert("RGB"))
+
+    # Calculate font size based on content and screen ratio
+    base_font_size = calculate_optimal_font_size(text_layers[0]["text"], VIDEO_SIZE)
+
+    # Create neon effect for each text layer
+    final_img = bg_img.copy()
+
+    y_offset = 0
+    line_spacing = int(base_font_size * 0.3)  # 30% line spacing
+
+    for i, layer in enumerate(text_layers):
+        text = layer["text"]
+        font_path = layer["font_path"]
+
+        # Calculate pulse phase for each layer (slightly offset for variety)
+        pulse_phase = t * 0.5 + i * math.pi / 3
+
+        # Select neon color (cycle through colors slowly)
+        color_index = int((t * 0.1) % len(NEON_COLORS))
+        neon_color = NEON_COLORS[color_index]
+
+        # Create neon text layer
+        neon_layer = create_neon_text_layer(
+            text,
+            font_path,
+            base_font_size,
+            neon_color,
+            glow_intensity=1.5,
+            pulse_phase=pulse_phase
+        )
+
+        # Position the text (centered vertically with spacing)
+        if len(text_layers) == 1:
+            # Single text block - center it
+            pos_y = (VIDEO_SIZE[1] - neon_layer.size[1]) // 2
+        else:
+            # Multiple blocks - space them out
+            total_text_height = sum(layer.size[1] for layer in text_layers) + (len(text_layers) - 1) * line_spacing
+            start_y = (VIDEO_SIZE[1] - total_text_height) // 2
+            pos_y = start_y + y_offset
+            y_offset += neon_layer.size[1] + line_spacing
+
+        # Composite the neon layer onto the background
+        final_img = Image.alpha_composite(final_img.convert("RGBA"), neon_layer)
+        final_img = final_img.convert("RGB")
+
+    return np.array(final_img)
+
+def create_background():
+    """Create a professional background"""
+    if BACKGROUND_THEME and BACKGROUND_THEME.lower() != "random" and BACKGROUND_THEME in GRADIENT_PALETTES:
+        top_color, bottom_color = GRADIENT_PALETTES[BACKGROUND_THEME]
+    else:
+        top_color, bottom_color = random.choice(list(GRADIENT_PALETTES.values()))
+
+    # Create gradient background
+    background = Image.new("RGB", VIDEO_SIZE)
+    draw = ImageDraw.Draw(background)
+
+    # Create vertical gradient
+    for y in range(VIDEO_SIZE[1]):
+        ratio = y / VIDEO_SIZE[1]
+        r = int(top_color[0] * (1 - ratio) + bottom_color[0] * ratio)
+        g = int(top_color[1] * (1 - ratio) + bottom_color[1] * ratio)
+        b = int(top_color[2] * (1 - ratio) + bottom_color[2] * ratio)
+        draw.line([(0, y), (VIDEO_SIZE[0], y)], fill=(r, g, b))
+
+    # Add subtle vignette
+    vignette = Image.new("L", VIDEO_SIZE, 0)
+    vdraw = ImageDraw.Draw(vignette)
+    vdraw.ellipse([-VIDEO_SIZE[0]*0.2, -VIDEO_SIZE[1]*0.2, VIDEO_SIZE[0]*1.2, VIDEO_SIZE[1]*1.2], fill=255)
+    vignette = vignette.filter(ImageFilter.GaussianBlur(int(200 * VIDEO_SIZE[0] / 3840)))
+    dark = Image.new("RGB", VIDEO_SIZE, (0, 0, 0))
+    background = Image.composite(background, dark, vignette)
+
+    return background
+
+def calculate_optimal_font_size(text, video_size):
+    """Calculate optimal font size based on text length and video dimensions"""
+    # Base font size for 4K
+    base_size = 120
+
+    # Adjust based on text length - shorter text = larger font
+    word_count = count_words(text)
+    if word_count <= 5:
+        size_multiplier = 1.8
+    elif word_count <= 10:
+        size_multiplier = 1.5
+    elif word_count <= 15:
+        size_multiplier = 1.2
+    elif word_count <= 20:
+        size_multiplier = 1.0
+    else:
+        size_multiplier = 0.8
+
+    # Ensure text fits comfortably in 60-70% of screen height
+    max_font_size = int(video_size[1] * 0.08)  # 8% of height
+    min_font_size = int(video_size[1] * 0.04)  # 4% of height
+
+    calculated_size = int(base_size * size_multiplier)
+    return max(min_font_size, min(calculated_size, max_font_size))
+
+def build_video(telugu_text, english_text, explanation_text):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+
+    # Calculate durations for each segment
+    telugu_duration = calculate_display_duration(telugu_text) if telugu_text else 0
+    english_duration = calculate_display_duration(english_text) if english_text else 0
+
+    # Total video duration
+    video_duration = telugu_duration + english_duration
+    if video_duration < 10:  # Minimum video length
+        video_duration = 10
+
+    print(f"Video duration: {video_duration:.1f}s")
+    print(f"Telugu duration: {telugu_duration:.1f}s ({count_words(telugu_text)} words)")
+    print(f"English duration: {english_duration:.1f}s ({count_words(english_text)} words)")
+
+    def make_frame(t):
+        # Determine which text to show based on time
+        if telugu_text and t < telugu_duration:
+            # Show Telugu text
+            return create_text_frame(telugu_text=telugu_text, t=t, total_duration=telugu_duration)
+        elif english_text and t >= telugu_duration:
+            # Show English text
+            return create_text_frame(english_text=english_text, t=t-telugu_duration, total_duration=english_duration)
+        else:
+            # Fallback - show whichever is available
+            return create_text_frame(
+                telugu_text=telugu_text if telugu_text else "",
+                english_text=english_text if english_text else "",
+                t=min(t, telugu_duration if telugu_text else english_duration),
+                total_duration=max(telugu_duration, english_duration)
+            )
+
+    clip = VideoClip(make_frame, duration=video_duration).set_fps(FPS)
+
+    # Add music
+    chosen_music = pick_music_file()
+    music_source = AudioFileClip(chosen_music)
+    end_time = min(5 + video_duration, music_source.duration)  # Start music at 5s
+    audio = music_source.subclip(5, end_time)
+    # Reduce audio volume for better experience
+    audio = audio.volumex(0.3)
+    clip = clip.set_audio(audio)
+
+    output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
+    clip.write_videofile(
+        output_path,
+        fps=FPS,
+        codec="libx264",
+        audio_codec="aac",
+        bitrate="15M",
+        preset="medium",
+        threads=4,
+        ffmpeg_params=["-pix_fmt", "yuv420p"],
+    )
+
+    # Generate thumbnail
+    thumbnail_path = generate_thumbnail(telugu_text, english_text)
+
+    return output_path, thumbnail_path
+
+def generate_thumbnail(telugu_text, english_text):
+    """Generate a professional YouTube thumbnail"""
+    thumb_size = (1280, 720)  # YouTube thumbnail size
+
+    # Create background
+    bg_img = create_background()
+    bg_img = bg_img.resize(thumb_size, Image.LANCZOS)
+
+    # Determine what text to show
+    if telugu_text and english_text:
+        display_text = f"{telugu_text}\n\n{english_text}"
+        font_path = FONT_PATH_TELUGU  # Use Telugu font for mixed content
+    elif telugu_text:
+        display_text = telugu_text
+        font_path = FONT_PATH_TELUGU
+    elif english_text:
+        display_text = english_text
+        font_path = FONT_PATH_LATIN
+    else:
+        display_text = "Daily Bible Verse"
+        font_path = FONT_PATH_LATIN
+
+    # Calculate font size for thumbnail
+    thumb_font_size = calculate_optimal_font_size_for_thumbnail(display_text, thumb_size)
+
+    # Create neon text for thumbnail
+    try:
+        font = ImageFont.truetype(font_path, thumb_font_size)
+    except:
+        font = ImageFont.load_default()
+
+    draw = ImageDraw.Draw(bg_img)
+
+    # Calculate text position to center it
+    bbox = draw.textbbox((0, 0), display_text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    x = (thumb_size[0] - text_width) // 2
+    y = (thumb_size[1] - text_height) // 2
+
+    # Draw neon effect for thumbnail
+    # Outer glow
+    for i in range(20, 0, -2):
+        alpha = int(30 * (20 - i) / 20)
+        glow_color = (*NEON_COLORS[0], alpha)
+        for dx in range(-i, i+1):
+            for dy in range(-i, i+1):
+                if dx*dx + dy*dy <= i*i:
+                    draw.text((x + dx, y + dy), display_text, font=font, fill=glow_color)
+
+    # Main text
+    draw.text((x, y), display_text, font=font, fill=(*NEON_COLORS[0], 255))
+
+    # Add "Daily Verse" badge
+    badge_text = "DAILY VERSE"
+    try:
+        badge_font = ImageFont.truetype(font_path, int(thumb_font_size * 0.6))
+    except:
+        badge_font = ImageFont.load_default()
+
+    badge_bbox = draw.textbbox((0, 0), badge_text, font=badge_font)
+    badge_width = badge_bbox[2] - badge_bbox[0]
+    badge_height = badge_bbox[3] - badge_bbox[1]
+    badge_x = 20
+    badge_y = thumb_size[1] - badge_height - 20
+
+    # Badge background
+    draw.rectangle([badge_x-10, badge_y-10, badge_x+badge_width+10, badge_y+badge_height+10],
+                   fill=(0, 0, 0, 180))
+    # Badge text
+    draw.text((badge_x, badge_y), badge_text, font=badge_font, fill=(255, 255, 0, 255))
+
+    # Save thumbnail
+    timestamp = int(time.time())
+    thumbnail_path = os.path.join(THUMBNAIL_DIR, f"thumbnail_{timestamp}.jpg")
+    bg_img.save(thumbnail_path, "JPEG", quality=95)
+
+    return thumbnail_path
+
+def pick_music_file():
+    music_files = sorted(f for f in os.listdir(MUSIC_DIR) if f.lower().endswith(".mp3"))
+    if not music_files:
+        raise FileNotFoundError(f"No .mp3 files found in {MUSIC_DIR}")
+    if MUSIC_CHOICE and MUSIC_CHOICE.lower() != "random":
+        for f in music_files:
+            if f.lower() == MUSIC_CHOICE.lower():
+                return os.path.join(MUSIC_DIR, f)
+        print(f"Warning: '{MUSIC_CHOICE}' not found, picking randomly instead.")
+    return os.path.join(MUSIC_DIR, random.choice(music_files))
+
+def get_user_credentials():
+    return UserCredentials(
+        None,
+        refresh_token=os.environ["YT_REFRESH_TOKEN"],
+        client_id=os.environ["YT_CLIENT_ID"],
+        client_secret=os.environ["YT_CLIENT_SECRET"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/youtube.upload",
+        ],
+    )
+
+def get_sheets_service():
+    sa_info = json.loads(os.environ["GCP_SERVICE_ACCOUNT_JSON"])
+    sa_creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=sa_creds)
+
+def get_youtube_service(creds):
+    return build("youtube", "v3", credentials=creds)
+
+def fetch_next_row(service):
+    range_ = f"{SHEET_TAB}!A2:D"
+    result = call_with_retries(
+        lambda: service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_).execute()
+    )
+    rows = result.get("values", [])
+    available = []
+    for i, row in enumerate(rows):
+        telugu = row[0] if len(row) > 0 else ""
+        english = row[1] if len(row) > 1 else ""
+        explanation = row[2] if len(row) > 2 else ""
+        used = row[3] if len(row) > 3 else ""
+        if (telugu or english) and used.strip().lower() != "used":
+            available.append((i + 2, telugu.strip(), english.strip(), explanation.strip()))
+
+    print(f"{len(available)} unused row(s) available out of {len(rows)} total sheet row(s).")
+    if not available:
+        return None, None, None, None
+    return random.choice(available)
+
+def mark_row_used(service, row_number):
+    call_with_retries(lambda: service.spreadsheets().values().update(
+        spreadsheetId=SHEET_ID,
+        range=f"{SHEET_TAB}!D{row_number}",
+        valueInputOption="RAW",
+        body={"values": [["used"]]},
+    ).execute())
+    print(f"Marked row {row_number}, Column D as 'used'.")
+
+def call_with_retries(func, max_retries=5, base_delay=5):
+    RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+    for attempt in range(1, max_retries + 1):
+        try:
+            return func()
+        except HttpError as e:
+            status = e.resp.status if getattr(e, "resp", None) else None
+            if status not in RETRYABLE_HTTP_STATUSES or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"Google API returned {status} — retrying in {delay}s (attempt {attempt}/{max_retries})...")
+            time.sleep(delay)
+        except (SSLError, ConnectionError, IncompleteRead, TimeoutError) as e:
+            if attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"Network hiccup ({e}) — retrying in {delay}s (attempt {attempt}/{max_retries})...")
+            time.sleep(delay)
+
+def upload_to_youtube(youtube, video_path, telugu_text, english_text):
+    base_text = english_text or telugu_text
+    title_source = re.sub(r"\([^()]*\)\s*$", "", base_text).strip()
+    title = (title_source[:80] + "...") if len(title_source) > 80 else title_source
+    if not title:
+        title = "Daily Bible Verse"
+
+    hashtags = generate_hashtags(telugu_text, english_text)
+    description = f"{telugu_text}\n\n{english_text}\n\n" + " ".join(hashtags)
+
+    privacy = PRIVACY_STATUS if PRIVACY_STATUS in ("private", "public", "unlisted") else "private"
+
+    body = {
+        "snippet": {
+            "title": title[:100],
+            "description": description,
+            "categoryId": "22",
+            "tags": [t.lstrip("#") for t in hashtags],
+        },
+        "status": {"privacyStatus": privacy},
+    }
+
+    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
+    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    response = None
+    while response is None:
+        status, response = call_with_retries(lambda: request.next_chunk())
+        if status:
+            print(f"Upload progress: {int(status.progress() * 100)}%")
+    print(f"Uploaded video ID: {response['id']} (privacy: {privacy})")
+    return response["id"]
+
+def main():
+    creds = get_user_credentials()
+    sheets_service = get_sheets_service()
+
+    row_number = None
+    if TELUGU_OVERRIDE or ENGLISH_OVERRIDE:
+        telugu_text, english_text, explanation_text = TELUGU_OVERRIDE, ENGLISH_OVERRIDE, EXPLANATION_OVERRIDE
+        print(f"Using override text — Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
+    else:
+        row_number, telugu_text, english_text, explanation_text = fetch_next_row(sheets_service)
+        if not telugu_text and not english_text:
+            print("No unused rows found in the sheet. Exiting.")
+            sys.exit(0)
+        print(f"Selected row {row_number} — Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
+
+    telugu_text = sanitize_text(telugu_text)
+    english_text = sanitize_text(english_text)
+    explanation_text = sanitize_text(explanation_text)
+
+    video_path, thumbnail_path = build_video(telugu_text, english_text, explanation_text)
+    print(f"Generated video: {video_path}")
+    print(f"Generated thumbnail: {thumbnail_path}")
+
+    youtube_service = get_youtube_service(creds)
+    upload_to_youtube(youtube_service, video_path, telugu_text, english_text)
+
+    if row_number is not None:
+        mark_row_used(sheets_service, row_number)
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
