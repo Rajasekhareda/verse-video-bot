@@ -1,1 +1,5 @@
+﻿client_secret.json
+get_sheets_token.py
+*.token
+.env
 output/
