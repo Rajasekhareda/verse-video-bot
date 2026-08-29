@@ -1,6 +1,6 @@
-google-api-python-client
-google-auth
-google-auth-oauthlib
-Pillow
-numpy
-moviepy==1.0.3
+pillow>=10.0
+numpy>=1.24
+moviepy>=2.0
+google-auth>=2.20
+google-auth-oauthlib>=1.0
+google-api-python-client>=2.90
