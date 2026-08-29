@@ -46,7 +46,7 @@ else:
     print(f"Warning: font not found at '{_FONT_PATH_LATIN_REQUESTED}', falling back to Noto Serif.")
     FONT_PATH_LATIN = _FONT_PATH_LATIN_FALLBACK
 
-VIDEO_DURATION = 45
+VIDEO_DURATION = 50           # ~50s — fits a single short verse on screen
 MUSIC_START_OFFSET = 10
 FPS = 24
 VIDEO_SIZE = (3840, 2160)   # 4K UHD
@@ -57,10 +57,10 @@ VIDEO_SIZE = (3840, 2160)   # 4K UHD
 RENDER_SCALE = VIDEO_SIZE[0] / 1280
 
 # Telugu glyphs render visibly taller than Latin ones at the same point size.
-# Column C (the note/explanation) now renders at the same size as Column A/B —
-# there is no longer a separate, smaller note font.
-MAIN_FONT_SIZE_LATIN = int(72 * RENDER_SCALE)
-MAIN_FONT_SIZE_TELUGU = int(54 * RENDER_SCALE)
+# Sizes bumped up significantly from the previous 72pt/54pt baseline so the
+# verse fills the frame much more at 4K and stays easy to read.
+MAIN_FONT_SIZE_LATIN = int(140 * RENDER_SCALE)
+MAIN_FONT_SIZE_TELUGU = int(105 * RENDER_SCALE)
 
 STROKE_WIDTH = int(3 * RENDER_SCALE)
 OUTLAY_STROKE_WIDTH = int(9 * RENDER_SCALE)   # thicker outer "outlay" border, drawn behind the gradient fill
@@ -73,17 +73,17 @@ SHADOW_OFFSET = int(4 * RENDER_SCALE)
 LINE_GAP_PT = 1.5               # fixed vertical gap between lines
 PT_TO_PX = 96 / 72               # standard 1pt = 1/72in at 96dpi, for on-screen video text
 
-SECONDS_PER_WORD = 0.35
-MAX_REVEAL_SECONDS = 12
+SECONDS_PER_LINE = 2.5            # how long each fully-revealed line stays on screen
+MAX_REVEAL_SECONDS = 10           # safety cap per phase's reveal window
 TEXT_MARGIN_X = int(130 * RENDER_SCALE)
 SAFE_TOP = int(110 * RENDER_SCALE)
 SAFE_BOTTOM = int(110 * RENDER_SCALE)
 TRANSITION_SECONDS = 1.3   # how long each scroll-out/scroll-in transition takes
 
-# Column-specific timing. If a column is missing (e.g. no explanation), the
-# remaining columns' durations are scaled up proportionally so the video
-# always totals exactly VIDEO_DURATION.
-COLUMN_DURATIONS = {"A": 15, "B": 12, "C": 18}
+# Per-column baseline duration at VIDEO_DURATION=240. These are multiplied by
+# (VIDEO_DURATION / 45) so the per-column pacing stays the same as the
+# original 45-second build regardless of the actual VIDEO_DURATION.
+_BASE_COLUMN_DURATIONS = {"A": 15, "B": 12, "C": 18}
 
 # Column C often has many lines. Rather than shrinking the font tiny to cram
 # them all in at once, it's split into readable groups shown one at a time
@@ -588,13 +588,16 @@ def render_video_frame(background, size, phases, t, stars):
         draw_text_block(img, draw, next_lines, next_phase["font"], next_phase["line_height"], size, in_offset, next_phase["colors"])
 
     elif idx == 0 and tl < reveal_duration:
-        words = phase["text"].split()
-        n_words = len(words)
-        words_to_show = min(n_words, int(tl / SECONDS_PER_WORD) + 1) if SECONDS_PER_WORD > 0 else n_words
-        visible_text = " ".join(words[:words_to_show])
-        max_width = size[0] - (TEXT_MARGIN_X * 2)
-        lines = wrap_text(draw, visible_text, phase["font"], max_width)
-        draw_text_block(img, draw, lines, phase["font"], phase["line_height"], size, 0, phase["colors"])
+        # Line-by-line reveal: each fully-formed line of the phase is shown
+        # one at a time, dwelling for SECONDS_PER_LINE before the next line
+        # joins it. We rebuild the wrap from the visible-prefix text so each
+        # line drops in already wrapped at the same width the final block
+        # uses — no reflow jump when the last line arrives.
+        all_lines = phase["lines"]
+        progress = tl / reveal_duration if reveal_duration > 0 else 1.0
+        n_to_show = min(len(all_lines), max(1, int(progress * len(all_lines)) + 1))
+        visible_lines = all_lines[:n_to_show]
+        draw_text_block(img, draw, visible_lines, phase["font"], phase["line_height"], size, 0, phase["colors"])
 
     elif "pages" in phase:
         # Column C: cycle through its grouped lines sequentially within its
@@ -648,16 +651,22 @@ def build_video(telugu_text, english_text, explanation_text):
 
     phases = [build_phase(text, style, size, column) for text, style, column in phase_specs]
 
-    # Fixed per-column durations (A=15s, B=12s, C=18s). If a column is
-    # missing, the remaining columns are scaled up proportionally so the
+    # Per-column durations scale with VIDEO_DURATION so the original
+    # 45s pacing is preserved regardless of how long the final clip is.
+    # If a column is missing, the remaining columns are scaled up so the
     # video always totals exactly VIDEO_DURATION.
-    intended_total = sum(COLUMN_DURATIONS[p["column"]] for p in phases)
+    intended_total = sum(_BASE_COLUMN_DURATIONS[p["column"]] for p in phases)
     scale = VIDEO_DURATION / intended_total if intended_total > 0 else 1
     for p in phases:
-        p["duration"] = COLUMN_DURATIONS[p["column"]] * scale
+        p["duration"] = _BASE_COLUMN_DURATIONS[p["column"]] * scale
 
-    n_words_first = len(phases[0]["text"].split())
-    phases[0]["reveal_duration"] = min(n_words_first * SECONDS_PER_WORD, MAX_REVEAL_SECONDS, phases[0]["duration"] * 0.6)
+    # The first phase reveals its text line-by-line. The reveal window is
+    # one line per SECONDS_PER_LINE, scaled to a comfortable fraction of
+    # the phase's own duration (no word-count cap) — long verses simply
+    # take longer to reveal, which is what we want.
+    n_lines_first = max(1, len(phases[0]["lines"]))
+    line_based = n_lines_first * SECONDS_PER_LINE
+    phases[0]["reveal_duration"] = min(line_based, phases[0]["duration"] - TRANSITION_SECONDS)
 
     # Column C (the note/explanation) often has many lines. Rather than
     # cramming them all into one shrunken block, group them into readable
