@@ -1,0 +1,46 @@
+﻿name: Generate and Upload Verse Video
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * *"
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system packages (ffmpeg + Unicode/Telugu fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto fonts-noto-core fonts-noto-extra
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the video generator
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          PRIVACY_STATUS: private
+        run: python generate_video_pro.py
+
+      - name: Upload output as workflow artifact (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verse-video-output
+          path: output/
+          retention-days: 7
