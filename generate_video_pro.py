@@ -87,20 +87,20 @@ SAFE_TOP = int(VIDEO_SIZE[1] * SAFE_MARGIN_TOP_RATIO)
 SAFE_BOTTOM = int(VIDEO_SIZE[1] * (1 - SAFE_MARGIN_BOTTOM_RATIO))
 SAFE_TEXT_WIDTH = int((SAFE_RIGHT - SAFE_LEFT) * 0.96)
 
-# Animation timing
-FADE_IN = 0.55
-FADE_OUT = 0.45
-RISE_PIXELS = 22.0                 # subtle upward drift during fade-in
-MIN_PAGE_DURATION = 2.9
-BASE_PAGE_SECONDS = 1.9
-PER_WORD_SECONDS = 0.59            # contemplative reading pace
+# Animation timing - UPDATED TO 10 SECONDS PER SLIDE
+FADE_IN = 1.2                      # Longer fade in for 10-second slides
+FADE_OUT = 1.2                     # Longer fade out for 10-second slides
+RISE_PIXELS = 30.0                 # More pronounced upward drift
+MIN_PAGE_DURATION = 10.0           # 10 seconds minimum per slide
+BASE_PAGE_SECONDS = 10.0           # 10 seconds base duration
+PER_WORD_SECONDS = 0.0             # No extra time per word (fixed 10s per slide)
 
-# Typography - Cinematic 2x enhanced
-TEXT_COLOR = (255, 255, 255, 255)          # full brightness white
-SHADOW_COLOR = (0, 0, 0, 200)               # stronger black shadow
-STROKE_COLOR = (0, 0, 0, 180)               # stronger outline
-SHADOW_BLUR_RADIUS = 4                      # cinematic blur
-LINE_SPACING_MULTIPLIER = 1.5               # improved line spacing (1.45 -> 2.17)
+# Typography - Enhanced cinematic styling with better readability
+TEXT_COLOR = (255, 255, 255, 255)          # Pure white for maximum contrast
+SHADOW_COLOR = (0, 0, 0, 220)              # Deeper shadow for depth
+STROKE_COLOR = (20, 20, 30, 200)           # Subtle dark blue stroke
+SHADOW_BLUR_RADIUS = 6                     # Stronger blur for cinematic effect
+LINE_SPACING_MULTIPLIER = 1.8              # More breathing room between lines
 
 # ================= ANIMATED NEON BORDER + CORNER STARS ================
 RENDER_SCALE = VIDEO_SIZE[0] / 1280
@@ -120,7 +120,7 @@ TELUGU_OVERRIDE = os.environ.get("TELUGU_OVERRIDE", "").strip()
 ENGLISH_OVERRIDE = os.environ.get("ENGLISH_OVERRIDE", "").strip()
 EXPLANATION_OVERRIDE = os.environ.get("EXPLANATION_OVERRIDE", "").strip()
 
-# Font overrides
+# Font overrides - UPDATED FOR BETTER TYPOGRAPHY
 FONT_PATH_TELUGU_ENV = os.environ.get("FONT_PATH_TELUGU", "").strip()
 FONT_PATH_LATIN_ENV = os.environ.get("FONT_PATH_LATIN", "").strip()
 
@@ -140,14 +140,14 @@ BASE_HASHTAGS = ["#BibleVerse", "#DailyVerse", "#Faith", "#God", "#Jesus", "#Scr
 TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#Telugu"]
 ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
 
-# Cross-platform font candidates
+# Cross-platform font candidates - PRIORITIZING MODERN FONTS
 FONT_CANDIDATES_TELUGU = [p for p in [
     FONT_PATH_TELUGU_ENV,
+    "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf",      # Serif first for elegance
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf",
-    "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf",
+    r"C:\Windows\Fonts\NirmalaB.ttf",                                # Bold variant preferred
     r"C:\Windows\Fonts\Nirmala.ttf",
-    r"C:\Windows\Fonts\NirmalaB.ttf",
     r"C:\Windows\Fonts\NotoSansTelugu-Regular.ttf",
     "/System/Library/Fonts/Supplemental/NotoSansTelugu-Regular.ttf",
     "/Library/Fonts/NotoSansTelugu-Regular.ttf",
@@ -155,8 +155,11 @@ FONT_CANDIDATES_TELUGU = [p for p in [
 
 FONT_CANDIDATES_LATIN = [p for p in [
     FONT_PATH_LATIN_ENV,
+    "/usr/share/fonts/truetype/noto/NotoSerif-Bold.ttf",            # Serif for elegance
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",        # Serif alternatives
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    r"C:\Windows\Fonts\georgia.ttf",                                 # Georgia for elegance
     r"C:\Windows\Fonts\segoeuib.ttf",
     r"C:\Windows\Fonts\arialbd.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -169,8 +172,8 @@ _FONT_SCAN_DIRS = {
     "Darwin": ["/System/Library/Fonts", "/Library/Fonts", os.path.expanduser("~/Library/Fonts")],
 }
 _FONT_SCAN_PATTERNS = {
-    "telugu": ["*Telugu*Bold*.ttf", "*Telugu*.ttf", "*Nirmala*.ttf"],
-    "latin": ["*NotoSans*Bold*.ttf", "*DejaVuSans*Bold*.ttf", "*Segoe*.ttf", "*Arial*Bold*.ttf", "*.ttf"],
+    "telugu": ["*Telugu*Bold*.ttf", "*Telugu*Serif*.ttf", "*Telugu*.ttf", "*Nirmala*.ttf"],
+    "latin": ["*Serif*Bold*.ttf", "*Georgia*.ttf", "*NotoSans*Bold*.ttf", "*DejaVuSans*Bold*.ttf", "*Segoe*.ttf", "*Arial*Bold*.ttf", "*.ttf"],
 }
 
 # ===================================================================
@@ -376,19 +379,19 @@ def paginate_lines(lines, max_lines=MAX_LINES):
 
 
 def choose_font_size(total_words, video_size):
-    """Calculate font size — 2x larger for cinematic impact."""
-    base = int(video_size[1] * 0.10) * 2  # 2x multiplier
+    """Calculate font size — enhanced for better readability."""
+    base = int(video_size[1] * 0.12) * 2  # Slightly larger base
     if total_words > 60:
-        scale = 0.70
+        scale = 0.75
     elif total_words > 40:
-        scale = 0.80
+        scale = 0.85
     elif total_words > 24:
-        scale = 0.90
+        scale = 0.95
     else:
         scale = 1.0
     size = int(base * scale)
-    min_size = int(video_size[1] * 0.085)
-    max_size = int(video_size[1] * 0.22)
+    min_size = int(video_size[1] * 0.09)
+    max_size = int(video_size[1] * 0.24)
     return max(min_size, min(size, max_size))
 
 
@@ -449,11 +452,11 @@ def _normalize_durations(durations, min_d, total):
 
 
 def schedule_durations(pages):
-    """Return per-page durations that sum exactly to TOTAL_DURATION."""
+    """Return per-page durations that sum exactly to TOTAL_DURATION - fixed 10s per slide."""
     raw = []
     for page in pages:
-        word_count = count_words(" ".join(page["lines"]))
-        raw.append(BASE_PAGE_SECONDS + word_count * PER_WORD_SECONDS)
+        # Fixed 10 seconds per slide regardless of word count
+        raw.append(MIN_PAGE_DURATION)
     return _normalize_durations(raw, MIN_PAGE_DURATION, TOTAL_DURATION)
 
 
@@ -463,7 +466,7 @@ def ease_out_cubic(p):
 
 
 def compute_opacity_and_offset(local_t, duration, fade_in=FADE_IN, fade_out=FADE_OUT):
-    """Opacity and vertical offset for fade-in/fade-out."""
+    """Opacity and vertical offset for fade-in/fade-out with 10-second timing."""
     fi = min(fade_in, duration * 0.4)
     fo = min(fade_out, duration * 0.4)
 
@@ -588,7 +591,7 @@ def compute_block_top(block_height, safe_top=SAFE_TOP, safe_bottom=SAFE_BOTTOM, 
 
 
 def render_page_layer(lines, font):
-    """Render one page's text to RGBA array at full opacity."""
+    """Render one page's text to RGBA array at full opacity with enhanced styling."""
     line_height = int(font.size * LINE_SPACING_MULTIPLIER)
     block_height = line_height * len(lines)
     top = compute_block_top(block_height)
@@ -597,7 +600,7 @@ def render_page_layer(lines, font):
     main_layer = Image.new("RGBA", VIDEO_SIZE, (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(shadow_layer)
     mdraw = ImageDraw.Draw(main_layer)
-    stroke_w = max(2, font.size // 24)  # enhanced stroke
+    stroke_w = max(3, font.size // 20)  # Thicker stroke for better definition
 
     max_line_width = 0.0
     for i, line in enumerate(lines):
@@ -607,12 +610,13 @@ def render_page_layer(lines, font):
         max_line_width = max(max_line_width, w)
         x = (VIDEO_SIZE[0] - w) / 2
         y = top + i * line_height
-        # Enhanced shadow: offset + blur
-        sdraw.text((x, y + font.size * 0.08), line, font=font, fill=SHADOW_COLOR)
-        # Main text: with enhanced stroke
+        # Enhanced multi-layer shadow for depth
+        sdraw.text((x + 2, y + 2), line, font=font, fill=(0, 0, 0, 180))
+        sdraw.text((x, y + font.size * 0.10), line, font=font, fill=SHADOW_COLOR)
+        # Main text with enhanced stroke
         mdraw.text((x, y), line, font=font, fill=TEXT_COLOR, stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
 
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=max(3, int(font.size * 0.06))))
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=SHADOW_BLUR_RADIUS))
     combined = Image.alpha_composite(shadow_layer, main_layer)
     block_info = {"top": top, "height": block_height, "max_width": max_line_width}
     return np.array(combined), block_info
@@ -717,7 +721,7 @@ def create_tts_clips(pages):
             except Exception as e:
                 print(f"Error loading TTS audio: {e}")
 
-        current_time += len(pages[page_idx].get("duration", MIN_PAGE_DURATION))
+        current_time += page_data.get("duration", MIN_PAGE_DURATION)
 
     return tts_clips if tts_clips else None
 
@@ -813,7 +817,7 @@ def build_video(telugu_text, english_text, explanation_text):
         starts.append(acc)
         acc += d
 
-    print(f"Prepared {len(pages)} text page(s) across {TOTAL_DURATION:.1f}s:")
+    print(f"Prepared {len(pages)} text page(s) across {TOTAL_DURATION:.1f}s (10s per slide):")
     for i, (p, d, s) in enumerate(zip(pages, durations, starts)):
         preview = " / ".join(p["lines"])
         print(f"  Page {i + 1}: {s:5.2f}s -> {s + d:5.2f}s ({d:4.2f}s)  {preview}")
