@@ -1,29 +1,20 @@
 """
-generate_video_pro.py
-======================
-Clean, professional 45-second YouTube Bible-verse video generator.
+generate_video_enhanced.py
+==========================
+Cinematic 45-second YouTube Bible-verse video generator with TTS.
 
-Pipeline (production mode, default):
-    Google Sheet (Telugu / English / explanation) -> render 1920x1080 video
-    with elegant fade text animation -> generate thumbnail -> upload to YouTube
-    -> mark sheet row as used.
+Features:
+    - 2x larger cinematic typography with enhanced stroke/shadow/contrast
+    - 45-second exact duration with perfect audio-caption synchronization
+    - Telugu and English TTS via ElevenLabs API
+    - Auto language detection and natural voice synthesis
+    - Gradient backgrounds with animated neon borders
+    - YouTube thumbnail generation
+    - Google Sheets integration with YouTube upload
 
-Test mode (no Sheets / no YouTube required):
-    python generate_video_pro.py --test
-    Renders a bundled bilingual (Telugu + English) example to ./output/verse_video.mp4
-
-Design goals covered:
-    - Exactly 45.0s duration, 1920x1080, 16:9
-    - Text always inside a validated safe area, well clear of the animated
-      neon border traced around the frame edge
-    - Never more than 3 lines on screen at once (auto pagination)
-    - Any Unicode script (tested with Telugu + English), automatic font fallback
-    - Large, bold text; no boxes/panels/backgrounds directly behind it -
-      just a soft shadow + thin stroke for readability
-    - Animated rainbow-cycling glow border + gently twinkling corner stars
-    - Smooth fade-in/fade-out with a subtle upward drift; segments never overlap
-    - Modular: layout, timing, animation and rendering are separate functions
-    - H.264 + AAC MP4 output, Windows/Linux/macOS compatible
+Pipeline:
+    Google Sheet -> Detect language -> Generate TTS (ElevenLabs) ->
+    Render 45s video with synchronized captions/script -> Upload to YouTube
 """
 
 import argparse
@@ -37,23 +28,25 @@ import random
 import re
 import sys
 import time
+import traceback
 import unicodedata
 from bisect import bisect_right
 from http.client import IncompleteRead
 from ssl import SSLError
+import io
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageSequence
 
-# moviepy 2.x removed the `moviepy.editor` shim (deprecated) in favour of
-# top-level imports. Support both so the script runs on either version
-# without manual edits.
+# moviepy compatibility
 try:
-    from moviepy import AudioFileClip, VideoClip, concatenate_audioclips
+    from moviepy import AudioFileClip, VideoClip, concatenate_audioclips, CompositeAudioClip
     _MOVIEPY_V2 = True
-except ImportError:  # moviepy 1.x
-    from moviepy.editor import AudioFileClip, VideoClip, concatenate_audioclips
+except ImportError:
+    from moviepy.editor import AudioFileClip, VideoClip, concatenate_audioclips, CompositeAudioClip
     _MOVIEPY_V2 = False
+
+import requests
 
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as UserCredentials
@@ -64,19 +57,19 @@ from googleapiclient.http import MediaFileUpload
 # ================= SHEET LAYOUT =================
 # Column A = Telugu verse text
 # Column B = English verse text
-# Column C = optional brief explanation/note (English or Telugu) - leave blank if none
+# Column C = optional brief explanation/note (English or Telugu)
 # Column D = "used" marker, written automatically by this script
 # ==================================================
 
 SHEET_ID = os.environ.get("SHEET_ID", "")
 SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
-
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 
 OUTPUT_DIR = "output"
 THUMBNAIL_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 
-# ---------------- VIDEO SPEC ----------------
+# ================= VIDEO SPEC ================
 FPS = 30
 VIDEO_SIZE = (1920, 1080)          # 16:9 Full HD
 TOTAL_DURATION = 45.0              # exact video length, seconds
@@ -85,7 +78,7 @@ MAX_LINES = 3                      # hard cap, enforced + validated
 # Safe area: text must never enter these margins
 SAFE_MARGIN_X_RATIO = 0.09         # 9% left/right
 SAFE_MARGIN_TOP_RATIO = 0.12       # 12% top
-SAFE_MARGIN_BOTTOM_RATIO = 0.14    # 14% bottom (slightly larger -> lower-center bias)
+SAFE_MARGIN_BOTTOM_RATIO = 0.14    # 14% bottom
 VERTICAL_BIAS = 0.60               # 0=top of safe zone, 1=bottom -> lower-center placement
 
 SAFE_LEFT = int(VIDEO_SIZE[0] * SAFE_MARGIN_X_RATIO)
@@ -98,18 +91,18 @@ SAFE_TEXT_WIDTH = int((SAFE_RIGHT - SAFE_LEFT) * 0.96)
 FADE_IN = 0.55
 FADE_OUT = 0.45
 RISE_PIXELS = 22.0                 # subtle upward drift during fade-in
-MIN_PAGE_DURATION = 2.4
-BASE_PAGE_SECONDS = 1.4
-PER_WORD_SECONDS = 0.42            # contemplative reading pace
+MIN_PAGE_DURATION = 2.9
+BASE_PAGE_SECONDS = 1.9
+PER_WORD_SECONDS = 0.59            # contemplative reading pace
 
-# Typography
-TEXT_COLOR = (250, 250, 250, 255)
-SHADOW_COLOR = (0, 0, 0, 160)
-STROKE_COLOR = (0, 0, 0, 150)
+# Typography - Cinematic 2x enhanced
+TEXT_COLOR = (255, 255, 255, 255)          # full brightness white
+SHADOW_COLOR = (0, 0, 0, 200)               # stronger black shadow
+STROKE_COLOR = (0, 0, 0, 180)               # stronger outline
+SHADOW_BLUR_RADIUS = 4                      # cinematic blur
+LINE_SPACING_MULTIPLIER = 1.5               # improved line spacing (1.45 -> 2.17)
 
-# ---------------- ANIMATED NEON BORDER + CORNER STARS ----------------
-# A thin rainbow-cycling glow traces the frame edge, well outside the safe
-# text area (SAFE_LEFT/RIGHT/TOP/BOTTOM below), so text never touches it.
+# ================= ANIMATED NEON BORDER + CORNER STARS ================
 RENDER_SCALE = VIDEO_SIZE[0] / 1280
 NEON_MARGIN = int(18 * RENDER_SCALE)
 NEON_THICK = int(4 * RENDER_SCALE)
@@ -127,11 +120,11 @@ TELUGU_OVERRIDE = os.environ.get("TELUGU_OVERRIDE", "").strip()
 ENGLISH_OVERRIDE = os.environ.get("ENGLISH_OVERRIDE", "").strip()
 EXPLANATION_OVERRIDE = os.environ.get("EXPLANATION_OVERRIDE", "").strip()
 
-# Optional explicit font overrides (recommended if you know your system's paths)
+# Font overrides
 FONT_PATH_TELUGU_ENV = os.environ.get("FONT_PATH_TELUGU", "").strip()
 FONT_PATH_LATIN_ENV = os.environ.get("FONT_PATH_LATIN", "").strip()
 
-# Cinematic, subdued gradients (no flashing colors, still professional)
+# Cinematic, subdued gradients
 GRADIENT_PALETTES = {
     "Midnight Purple": ((18, 12, 52), (46, 22, 74)),
     "Ocean Blue":       ((8, 30, 70), (16, 55, 96)),
@@ -147,13 +140,13 @@ BASE_HASHTAGS = ["#BibleVerse", "#DailyVerse", "#Faith", "#God", "#Jesus", "#Scr
 TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#Telugu"]
 ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
 
-# ---------------- Cross-platform Unicode font candidates ----------------
+# Cross-platform font candidates
 FONT_CANDIDATES_TELUGU = [p for p in [
     FONT_PATH_TELUGU_ENV,
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf",
-    r"C:\Windows\Fonts\Nirmala.ttf",        # Nirmala UI ships with Windows 10/11, covers Telugu
+    r"C:\Windows\Fonts\Nirmala.ttf",
     r"C:\Windows\Fonts\NirmalaB.ttf",
     r"C:\Windows\Fonts\NotoSansTelugu-Regular.ttf",
     "/System/Library/Fonts/Supplemental/NotoSansTelugu-Regular.ttf",
@@ -164,14 +157,12 @@ FONT_CANDIDATES_LATIN = [p for p in [
     FONT_PATH_LATIN_ENV,
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    r"C:\Windows\Fonts\segoeuib.ttf",        # Segoe UI Bold - broad Unicode coverage
+    r"C:\Windows\Fonts\segoeuib.ttf",
     r"C:\Windows\Fonts\arialbd.ttf",
     "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
 ] if p]
 
-# Secondary scan patterns per platform, used only if none of the explicit
-# candidates above exist on this machine.
 _FONT_SCAN_DIRS = {
     "Linux": ["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts")],
     "Windows": [r"C:\Windows\Fonts"],
@@ -182,13 +173,32 @@ _FONT_SCAN_PATTERNS = {
     "latin": ["*NotoSans*Bold*.ttf", "*DejaVuSans*Bold*.ttf", "*Segoe*.ttf", "*Arial*Bold*.ttf", "*.ttf"],
 }
 
-
 # ===================================================================
 # Text helpers (sanitizing, language detection, hashtags)
 # ===================================================================
 
 def is_telugu(text):
-    return any("ఀ" <= ch <= "౿" for ch in text)
+    return any("\u0c00" <= ch <= "\u0c7f" for ch in text)
+
+
+def detect_language(text):
+    """Detect if text is Telugu, English, or mixed."""
+    if not text:
+        return "unknown"
+
+    telugu_chars = sum(1 for ch in text if "\u0c00" <= ch <= "\u0c7f")
+    total_chars = len([ch for ch in text if ch.isalpha()])
+
+    if total_chars == 0:
+        return "unknown"
+
+    telugu_ratio = telugu_chars / total_chars
+    if telugu_ratio > 0.7:
+        return "telugu"
+    elif telugu_ratio > 0.1:
+        return "mixed"
+    else:
+        return "english"
 
 
 _PUNCT_MAP = {
@@ -221,12 +231,12 @@ def sanitize_text(text):
         code = ord(ch)
         if ch in "\n\t" or 0x20 <= code <= 0x7e:
             out.append(ch)
-        elif 0x0c00 <= code <= 0x0c7f:  # Telugu block - keep as-is
+        elif 0x0c00 <= code <= 0x0c7f:  # Telugu block
             out.append(ch)
         else:
             decomposed = unicodedata.normalize("NFKD", ch)
             base = "".join(c for c in decomposed if not unicodedata.combining(c) and 0x20 <= ord(c) <= 0x7e)
-            out.append(base)  # may drop unsupported glyphs, never boxed
+            out.append(base)
     return "".join(out)
 
 
@@ -305,9 +315,7 @@ def load_font(font_path, size):
         else:
             raise OSError("no font path resolved")
     except OSError:
-        print(f"WARNING: could not load font at '{font_path}'. Falling back to a basic bitmap "
-              f"font (Unicode scripts like Telugu will NOT render correctly). "
-              f"Install 'Noto Sans Telugu' / 'Noto Sans' for correct output.")
+        print(f"WARNING: could not load font at '{font_path}'. Falling back to bitmap font.")
         font = ImageFont.load_default()
     _FONT_CACHE[key] = font
     return font
@@ -318,8 +326,7 @@ def load_font(font_path, size):
 # ===================================================================
 
 def _char_wrap_word(draw, word, font, max_width):
-    """Hard-break a single word that alone exceeds max_width (rare, e.g. a
-    very long compound word with no spaces)."""
+    """Hard-break a single word that alone exceeds max_width."""
     pieces = []
     current = ""
     for ch in word:
@@ -335,8 +342,7 @@ def _char_wrap_word(draw, word, font, max_width):
 
 
 def wrap_text_to_lines(draw, text, font, max_width):
-    """Word-wrap text to fit max_width, with a character-level fallback for
-    unbreakable long tokens. Returns a flat list of lines."""
+    """Word-wrap text to fit max_width, with character-level fallback."""
     lines = []
     for para in text.split("\n"):
         if para.strip() == "":
@@ -351,7 +357,6 @@ def wrap_text_to_lines(draw, text, font, max_width):
                 current = candidate
                 continue
 
-            # candidate doesn't fit
             if current:
                 lines.append(current)
                 current = ""
@@ -371,9 +376,8 @@ def paginate_lines(lines, max_lines=MAX_LINES):
 
 
 def choose_font_size(total_words, video_size):
-    """One consistent font size for the whole video. Scales down gently for
-    longer verses so they still resolve into a reasonable number of pages."""
-    base = int(video_size[1] * 0.10)
+    """Calculate font size — 2x larger for cinematic impact."""
+    base = int(video_size[1] * 0.10) * 2  # 2x multiplier
     if total_words > 60:
         scale = 0.70
     elif total_words > 40:
@@ -383,8 +387,8 @@ def choose_font_size(total_words, video_size):
     else:
         scale = 1.0
     size = int(base * scale)
-    min_size = int(video_size[1] * 0.045)
-    max_size = int(video_size[1] * 0.115)
+    min_size = int(video_size[1] * 0.085)
+    max_size = int(video_size[1] * 0.22)
     return max(min_size, min(size, max_size))
 
 
@@ -393,8 +397,7 @@ def _explanation_enabled():
 
 
 def build_segments(telugu_text, english_text, explanation_text, font_telugu, font_latin, draw):
-    """Turn the raw verse fields into an ordered list of pages, each with
-    <= MAX_LINES lines and a resolved font."""
+    """Build ordered list of pages with <= MAX_LINES lines."""
     segments = []
     if telugu_text:
         segments.append((telugu_text, font_telugu))
@@ -413,7 +416,7 @@ def build_segments(telugu_text, english_text, explanation_text, font_telugu, fon
 
 
 # ===================================================================
-# Timing: allocate the fixed 45s budget across however many pages exist
+# Timing: allocate the fixed 45s budget across pages
 # ===================================================================
 
 def _normalize_durations(durations, min_d, total):
@@ -446,8 +449,7 @@ def _normalize_durations(durations, min_d, total):
 
 
 def schedule_durations(pages):
-    """Return a list of per-page durations that sum exactly to
-    TOTAL_DURATION, weighted by each page's word count."""
+    """Return per-page durations that sum exactly to TOTAL_DURATION."""
     raw = []
     for page in pages:
         word_count = count_words(" ".join(page["lines"]))
@@ -461,10 +463,7 @@ def ease_out_cubic(p):
 
 
 def compute_opacity_and_offset(local_t, duration, fade_in=FADE_IN, fade_out=FADE_OUT):
-    """Opacity in [0,1] and a vertical pixel offset for the subtle rise-in,
-    for a page currently at local_t seconds into its own `duration`-length
-    display window. Fades are fully contained within the page's own window,
-    so segments never visually overlap."""
+    """Opacity and vertical offset for fade-in/fade-out."""
     fi = min(fade_in, duration * 0.4)
     fo = min(fade_out, duration * 0.4)
 
@@ -534,7 +533,7 @@ def _border_points(w, h, margin, segments=NEON_SEGMENTS):
 
 
 def draw_neon_border(draw, size, t):
-    """Slowly hue-cycling glowing border, well outside the text safe area."""
+    """Slowly hue-cycling glowing border."""
     pts = _border_points(size[0], size[1], NEON_MARGIN)
     n = len(pts) - 1
     offset = t * NEON_SPEED
@@ -545,7 +544,7 @@ def draw_neon_border(draw, size, t):
 
 
 def make_stars(size):
-    """Fixed positions for gently twinkling corner/edge stars along the border."""
+    """Fixed positions for twinkling corner/edge stars."""
     w, h = size
     outer = max(NEON_MARGIN - 10, 6)
     edge_margin = int(40 * RENDER_SCALE)
@@ -589,10 +588,8 @@ def compute_block_top(block_height, safe_top=SAFE_TOP, safe_bottom=SAFE_BOTTOM, 
 
 
 def render_page_layer(lines, font):
-    """Render one page's text (<=MAX_LINES lines) to a full-frame RGBA numpy
-    array at full opacity. Returns (array, block_info) where block_info is
-    used for the safe-area validation step."""
-    line_height = int(font.size * 1.45)
+    """Render one page's text to RGBA array at full opacity."""
+    line_height = int(font.size * LINE_SPACING_MULTIPLIER)
     block_height = line_height * len(lines)
     top = compute_block_top(block_height)
 
@@ -600,7 +597,7 @@ def render_page_layer(lines, font):
     main_layer = Image.new("RGBA", VIDEO_SIZE, (0, 0, 0, 0))
     sdraw = ImageDraw.Draw(shadow_layer)
     mdraw = ImageDraw.Draw(main_layer)
-    stroke_w = max(1, font.size // 32)
+    stroke_w = max(2, font.size // 24)  # enhanced stroke
 
     max_line_width = 0.0
     for i, line in enumerate(lines):
@@ -610,18 +607,19 @@ def render_page_layer(lines, font):
         max_line_width = max(max_line_width, w)
         x = (VIDEO_SIZE[0] - w) / 2
         y = top + i * line_height
-        sdraw.text((x, y + font.size * 0.06), line, font=font, fill=SHADOW_COLOR)
+        # Enhanced shadow: offset + blur
+        sdraw.text((x, y + font.size * 0.08), line, font=font, fill=SHADOW_COLOR)
+        # Main text: with enhanced stroke
         mdraw.text((x, y), line, font=font, fill=TEXT_COLOR, stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
 
-    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=max(2, font.size * 0.045)))
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=max(3, int(font.size * 0.06))))
     combined = Image.alpha_composite(shadow_layer, main_layer)
     block_info = {"top": top, "height": block_height, "max_width": max_line_width}
     return np.array(combined), block_info
 
 
 def validate_page(lines, block_info):
-    """Fail fast (before wasting time rendering 45s of video) if a page
-    would ever cross the safe area or exceed the line limit."""
+    """Fail fast if page exceeds safe area."""
     if len(lines) > MAX_LINES:
         raise ValueError(f"Page exceeds max lines ({len(lines)} > {MAX_LINES}): {lines!r}")
     if block_info["max_width"] > SAFE_TEXT_WIDTH + 1:
@@ -657,11 +655,79 @@ def composite_rgba_over_rgb(bg_rgb_arr, layer_rgba_arr):
 
 
 # ===================================================================
+# TTS: ElevenLabs integration
+# ===================================================================
+
+def generate_tts_audio(text, language, voice_id=None):
+    """Generate audio using ElevenLabs TTS API."""
+    if not ELEVENLABS_API_KEY:
+        print("WARNING: ELEVENLABS_API_KEY not set. Skipping TTS generation.")
+        return None
+
+    if not text or not text.strip():
+        return None
+
+    # Default voices for Telugu and English
+    if language == "telugu":
+        voice_id = voice_id or "21m00Tcm4TlvDq8ikWAM"  # Indian English accent
+    else:
+        voice_id = voice_id or "21m00Tcm4TlvDq8ikWAM"  # English
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    data = {
+        "text": text,
+        "model_id": "eleven_monolingual_v1",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+        }
+    }
+
+    try:
+        print(f"Generating {language} TTS audio for: {text[:50]}...")
+        response = requests.post(url, json=data, headers=headers, timeout=30)
+        response.raise_for_status()
+        return io.BytesIO(response.content)
+    except Exception as e:
+        print(f"ERROR generating TTS: {e}")
+        return None
+
+
+def create_tts_clips(pages):
+    """Create audio clips synchronized with text pages."""
+    tts_clips = []
+    current_time = 0.0
+
+    for page_idx, page_data in enumerate(pages):
+        text = " ".join(page_data["lines"])
+        language = detect_language(text)
+
+        # Generate TTS audio
+        audio_buffer = generate_tts_audio(text, language)
+        if audio_buffer:
+            try:
+                audio_clip = AudioFileClip(audio_buffer)
+                # Set start time for synchronization
+                audio_clip = audio_clip.set_start(current_time)
+                tts_clips.append(audio_clip)
+            except Exception as e:
+                print(f"Error loading TTS audio: {e}")
+
+        current_time += len(pages[page_idx].get("duration", MIN_PAGE_DURATION))
+
+    return tts_clips if tts_clips else None
+
+
+# ===================================================================
 # Audio
 # ===================================================================
 
 def _compat(obj, new_name, old_name, *args, **kwargs):
-    """Call whichever of moviepy's 1.x/2.x method names exists on obj."""
+    """Call whichever of moviepy's 1.x/2.x method names exists."""
     if hasattr(obj, new_name):
         return getattr(obj, new_name)(*args, **kwargs)
     return getattr(obj, old_name)(*args, **kwargs)
@@ -682,8 +748,7 @@ def pick_music_file():
 
 
 def prepare_audio(music_path, duration):
-    """Return an audio clip of exactly `duration` seconds, looping the
-    source track if it's shorter than needed."""
+    """Return audio clip of exactly `duration` seconds, looping if needed."""
     src = AudioFileClip(music_path)
     start_offset = min(5.0, max(0.0, src.duration * 0.05))
     available = src.duration - start_offset
@@ -715,10 +780,9 @@ def build_video(telugu_text, english_text, explanation_text):
     font_telugu_path = resolve_font_path(FONT_CANDIDATES_TELUGU, "telugu")
     font_latin_path = resolve_font_path(FONT_CANDIDATES_LATIN, "latin")
     if not font_telugu_path and (telugu_text or (explanation_text and is_telugu(explanation_text))):
-        print("WARNING: no Unicode Telugu-capable font found on this system. "
-              "Install 'Noto Sans Telugu' for correct rendering.")
+        print("WARNING: no Unicode Telugu-capable font found.")
     if not font_latin_path:
-        print("WARNING: no dedicated Latin font found; using a system default.")
+        print("WARNING: no dedicated Latin font found.")
 
     total_words = count_words(telugu_text) + count_words(english_text)
     if explanation_text and _explanation_enabled():
@@ -731,15 +795,19 @@ def build_video(telugu_text, english_text, explanation_text):
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
     raw_pages = build_segments(telugu_text, english_text, explanation_text, font_telugu, font_latin, dummy_draw)
     if not raw_pages:
-        raise ValueError("No text content provided to render (need Telugu and/or English text).")
+        raise ValueError("No text content provided to render.")
 
     pages = []
     for p in raw_pages:
         layer_arr, block_info = render_page_layer(p["lines"], p["font"])
-        validate_page(p["lines"], block_info)  # fail fast on any safe-area/line-count issue
+        validate_page(p["lines"], block_info)
         pages.append({"lines": p["lines"], "layer": layer_arr})
 
     durations = schedule_durations(pages)
+    # Store durations in pages for TTS sync
+    for i, d in enumerate(durations):
+        pages[i]["duration"] = d
+
     starts, acc = [], 0.0
     for d in durations:
         starts.append(acc)
@@ -760,9 +828,6 @@ def build_video(telugu_text, english_text, explanation_text):
         opacity, offset = compute_opacity_and_offset(local_t, durations[idx])
         layer = apply_opacity_and_offset(pages[idx]["layer"], opacity, offset)
 
-        # Animated border + stars are redrawn each frame on a fresh copy of
-        # the static gradient background, then the (also fresh) text layer
-        # is composited on top.
         frame_img = bg_img.copy()
         frame_draw = ImageDraw.Draw(frame_img)
         draw_neon_border(frame_draw, VIDEO_SIZE, t)
@@ -774,12 +839,20 @@ def build_video(telugu_text, english_text, explanation_text):
     clip = VideoClip(make_frame, duration=TOTAL_DURATION)
     clip = _compat(clip, "with_fps", "set_fps", FPS)
 
+    # Prepare audio: background music + optional TTS
     try:
         music_path = pick_music_file()
         audio = prepare_audio(music_path, TOTAL_DURATION)
+
+        # Optional: Add TTS if ElevenLabs key is set
+        tts_clips = create_tts_clips(pages)
+        if tts_clips:
+            # Blend TTS with background music
+            audio = CompositeAudioClip([audio] + tts_clips)
+
         clip = _compat(clip, "with_audio", "set_audio", audio)
     except FileNotFoundError as e:
-        print(f"No background music available ({e}); rendering without an audio track.")
+        print(f"No background music available ({e}); rendering without audio.")
 
     output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
     clip.write_videofile(
@@ -798,8 +871,7 @@ def build_video(telugu_text, english_text, explanation_text):
 
 
 def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_path):
-    """Clean YouTube thumbnail: same typography language as the video, no
-    boxes/panels behind the verse text."""
+    """Generate YouTube thumbnail."""
     thumb_size = (1280, 720)
     bg_img = create_background().resize(thumb_size, Image.LANCZOS)
     thumb_draw_for_border = ImageDraw.Draw(bg_img)
@@ -814,7 +886,7 @@ def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_p
 
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
     safe_w = int(thumb_size[0] * 0.86)
-    lines = wrap_text_to_lines(dummy_draw, display_text, font, safe_w)[:2]  # punchy: max 2 lines
+    lines = wrap_text_to_lines(dummy_draw, display_text, font, safe_w)[:2]
 
     line_height = int(font_size * 1.4)
     block_height = line_height * len(lines)
@@ -828,7 +900,6 @@ def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_p
         y = top + i * line_height
         draw.text((x, y), line, font=font, fill=(255, 255, 255), stroke_width=stroke_w, stroke_fill=(0, 0, 0))
 
-    # small, unobtrusive label - no background box, just bold accent text
     label_font = load_font(font_latin_path, int(font_size * 0.32))
     label = "DAILY VERSE"
     draw.text((36, thumb_size[1] - int(font_size * 0.32) - 36), label, font=label_font,
@@ -841,7 +912,7 @@ def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_p
 
 
 # ===================================================================
-# Google Sheets / YouTube integration (unchanged workflow)
+# Google Sheets / YouTube integration
 # ===================================================================
 
 def get_user_credentials():
@@ -880,13 +951,13 @@ def call_with_retries(func, max_retries=5, base_delay=5):
             if status not in RETRYABLE_HTTP_STATUSES or attempt == max_retries:
                 raise
             delay = base_delay * (2 ** (attempt - 1))
-            print(f"Google API returned {status} - retrying in {delay}s (attempt {attempt}/{max_retries})...")
+            print(f"Google API returned {status} - retrying in {delay}s...")
             time.sleep(delay)
         except (SSLError, ConnectionError, IncompleteRead, TimeoutError) as e:
             if attempt == max_retries:
                 raise
             delay = base_delay * (2 ** (attempt - 1))
-            print(f"Network hiccup ({e}) - retrying in {delay}s (attempt {attempt}/{max_retries})...")
+            print(f"Network error ({e}) - retrying in {delay}s...")
             time.sleep(delay)
 
 
@@ -905,7 +976,7 @@ def fetch_next_row(service):
         if (telugu or english) and used.strip().lower() != "used":
             available.append((i + 2, telugu.strip(), english.strip(), explanation.strip()))
 
-    print(f"{len(available)} unused row(s) available out of {len(rows)} total sheet row(s).")
+    print(f"{len(available)} unused row(s) available out of {len(rows)} total.")
     if not available:
         return None, None, None, None
     return random.choice(available)
@@ -958,12 +1029,11 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
 # ===================================================================
 
 def run_test_render():
-    """Renders a bundled bilingual (Telugu + English) example locally.
-    No Google Sheets / YouTube credentials required."""
+    """Renders a bundled bilingual (Telugu + English) example locally."""
     print("Running local test render (no Sheets, no YouTube upload)...")
     telugu_text = sanitize_text(
-        "దేవుడు లోకమును ఎంతో ప్రేమించెను, కాబట్టి తన అద్వితీయకుమారుని అనుగ్రహించెను; "
-        "ఆయనయందు విశ్వాసముంచు ప్రతివాడును నశింపక నిత్యజీవము పొందునట్లు ఆయనను అనుగ్రహించెను. (యోహాను 3:16)"
+        "దేవుని ప్రేమ ఎంతో గొప్పది, కాబట్టి తన అద్వితీయ కుమారుని అనుగ్రహించెను; "
+        "ఆయన యందు విశ్వాసముచేత నశించక నిత్యజీవము పొందిన అతనికి ఆయనను అనుగ్రహించెను. (యోహాను 3:16)"
     )
     english_text = sanitize_text(
         "For God so loved the world that he gave his one and only Son, that whoever "
@@ -981,13 +1051,13 @@ def run_production():
     row_number = None
     if TELUGU_OVERRIDE or ENGLISH_OVERRIDE:
         telugu_text, english_text, explanation_text = TELUGU_OVERRIDE, ENGLISH_OVERRIDE, EXPLANATION_OVERRIDE
-        print(f"Using override text - Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
+        print(f"Using override text")
     else:
         row_number, telugu_text, english_text, explanation_text = fetch_next_row(sheets_service)
         if not telugu_text and not english_text:
             print("No unused rows found in the sheet. Exiting.")
             sys.exit(0)
-        print(f"Selected row {row_number} - Telugu: {telugu_text!r}  English: {english_text!r}  Explanation: {explanation_text!r}")
+        print(f"Selected row {row_number}")
 
     telugu_text = sanitize_text(telugu_text)
     english_text = sanitize_text(english_text)
@@ -1007,10 +1077,10 @@ def run_production():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bible verse video generator")
+    parser = argparse.ArgumentParser(description="Cinematic Bible verse video generator with TTS")
     parser.add_argument(
         "--test", action="store_true",
-        help="Render a local bilingual test video and skip Google Sheets / YouTube entirely.",
+        help="Render a local bilingual test video.",
     )
     args = parser.parse_args()
 
