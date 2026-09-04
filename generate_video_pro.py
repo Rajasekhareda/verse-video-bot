@@ -23,7 +23,6 @@ Pipeline:
 
 import argparse
 import atexit
-import colorsys
 import glob
 import json
 import math
@@ -96,7 +95,7 @@ MAX_LINES = 3                      # hard cap per page
 SAFE_MARGIN_X_RATIO = 0.09
 SAFE_MARGIN_TOP_RATIO = 0.12
 SAFE_MARGIN_BOTTOM_RATIO = 0.14
-VERTICAL_BIAS = 0.60
+VERTICAL_BIAS = 0.0                # text block starts at TOP of safe area
 
 SAFE_LEFT = int(VIDEO_SIZE[0] * SAFE_MARGIN_X_RATIO)
 SAFE_RIGHT = int(VIDEO_SIZE[0] * (1 - SAFE_MARGIN_X_RATIO))
@@ -104,32 +103,35 @@ SAFE_TOP = int(VIDEO_SIZE[1] * SAFE_MARGIN_TOP_RATIO)
 SAFE_BOTTOM = int(VIDEO_SIZE[1] * (1 - SAFE_MARGIN_BOTTOM_RATIO))
 SAFE_TEXT_WIDTH = int((SAFE_RIGHT - SAFE_LEFT) * 0.96)
 
-# ============ WORD-BY-WORD ANIMATION TIMING ============
-# Each page: words enter one-by-one (PPT style), the completed text
-# holds, then fades away cleanly before the next page appears.
-WORD_FADE = 0.35          # seconds for each word to fade in
-WORD_STAGGER = 0.24       # seconds between consecutive word starts
-WORD_RISE_PIXELS = 18     # each word rises slightly as it appears
+# ============ LINE-BY-LINE ANIMATION TIMING ============
+# Each page: lines enter one-by-one from the top of the screen,
+# the completed text holds, then fades away cleanly.
+LINE_FADE = 0.5           # seconds for each line to fade in
+LINE_STAGGER = 0.75       # seconds between consecutive line starts
+LINE_RISE_PIXELS = 24     # each line rises slightly as it appears
 ENTRANCE_CAP = 6.0        # max seconds for a page's full entrance
 HOLD_SECONDS = 6.0        # text holds this long after entrance
 PAGE_FADE_OUT = 0.9       # clean fade-away duration at page end
 MIN_PAGE_DURATION = 3.0   # never squeeze a page below this
 
 # Typography
-TEXT_COLOR = (255, 255, 255, 255)
 SHADOW_COLOR = (0, 0, 0, 220)
 STROKE_COLOR = (20, 20, 30, 200)
 SHADOW_BLUR_RADIUS = 6
 LINE_SPACING_MULTIPLIER = 1.45
 
-# ================= ANIMATED NEON BORDER + CORNER STARS ================
-RENDER_SCALE = VIDEO_SIZE[0] / 1280
-NEON_MARGIN = int(18 * RENDER_SCALE)
-NEON_THICK = int(4 * RENDER_SCALE)
-NEON_GLOW = int(10 * RENDER_SCALE)
-NEON_SPEED = 0.10
-NEON_SEGMENTS = 14
-STARS_PER_SIDE = 5
+# Cinematic text accents matched to each gradient palette
+TEXT_ACCENTS = {
+    "Midnight Purple": (232, 225, 255),   # soft lavender-white
+    "Ocean Blue":      (214, 236, 255),   # ice-blue white
+    "Wine Red":        (255, 226, 229),   # rose white
+    "Emerald Teal":    (222, 255, 244),   # mint white
+    "Sunset Amber":    (255, 236, 204),   # warm amber cream
+    "Indigo Violet":   (228, 224, 255),   # periwinkle white
+    "Midnight Slate":  (233, 240, 247),   # silver-blue white
+    "Charcoal":        (250, 246, 238),   # warm cream
+}
+DEFAULT_TEXT_ACCENT = (255, 244, 224)  # warm cinematic cream-gold
 
 # ============ BACKGROUNDS ============
 # BACKGROUND_MODE: gradient | image | gif | video
@@ -520,9 +522,9 @@ def paginate_lines(lines, max_lines=MAX_LINES):
 
 
 def choose_font_size(total_words, video_size):
-    """Readable cinematic sizing (roughly 48-124px at 1080p)."""
+    """Readable cinematic sizing, ~75% larger than before."""
     h = video_size[1]
-    base = int(h * 0.10)
+    base = int(h * 0.175)  # 0.10 * 1.75
     if total_words > 60:
         scale = 0.52
     elif total_words > 40:
@@ -534,7 +536,7 @@ def choose_font_size(total_words, video_size):
     else:
         scale = 1.0
     size = int(base * scale)
-    return max(int(h * 0.045), min(size, int(h * 0.115)))
+    return max(int(h * 0.08), min(size, int(h * 0.20)))
 
 
 def _explanation_enabled():
@@ -562,7 +564,7 @@ def build_segments(telugu_text, english_text, explanation_text, font_telugu, fon
 
 
 # ===================================================================
-# Timing: word-by-word entrance + 6s hold + clean fade, exact 45s total
+# Timing: line-by-line entrance (from top) + 6s hold + clean fade
 # ===================================================================
 
 def ease_out_cubic(p):
@@ -579,8 +581,8 @@ def schedule_pages(pages):
     so the video is exactly 45 seconds.
     """
     for p in pages:
-        nw = max(1, p["n_words"])
-        entrance = min(ENTRANCE_CAP, (nw - 1) * WORD_STAGGER + WORD_FADE)
+        nl = max(1, p["n_lines"])
+        entrance = min(ENTRANCE_CAP, (nl - 1) * LINE_STAGGER + LINE_FADE)
         p["entrance"] = entrance
         p["fade_out"] = PAGE_FADE_OUT
         p["raw"] = entrance + HOLD_SECONDS + PAGE_FADE_OUT
@@ -617,20 +619,21 @@ def schedule_pages(pages):
         f = d / p["raw"]
         p["fade_out"] = max(0.1, min(p["fade_out"] * f, d * 0.3))
         p["entrance"] = max(0.2, min(p["entrance"] * f, d - p["fade_out"] - 0.1))
-        wf = max(0.08, min(WORD_FADE * f, p["entrance"] * 0.5))
-        p["word_fade"] = wf
-        nw = p["n_words"]
-        if nw > 1:
-            stagger = max(0.01, (p["entrance"] - wf) / (nw - 1))
+        lf = max(0.08, min(LINE_FADE * f, p["entrance"] * 0.5))
+        p["line_fade"] = lf
+        nl = p["n_lines"]
+        if nl > 1:
+            stagger = max(0.01, (p["entrance"] - lf) / (nl - 1))
         else:
             stagger = 0.0
-        p["word_starts"] = [i * stagger for i in range(nw)]
+        p["line_starts"] = [i * stagger for i in range(nl)]
         starts.append(acc)
         acc += d
     return starts
 
 # ===================================================================
 # Backgrounds: gradient / image / gif / video (cover-fit + dim)
+#              (No animated overlays: no flickering borders/stars)
 # ===================================================================
 
 _LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
@@ -672,12 +675,46 @@ def _finish_still(img, dim):
                            _vignette_mask())
 
 
+_ACTIVE_PALETTE_NAME = [None]
+
+
+def pick_gradient_palette():
+    """Choose the gradient palette once per video: explicit theme,
+    else random. Re-uses the active choice so background and text
+    tint stay consistent (and the gradient never re-picks mid-video)."""
+    name = None
+    if BACKGROUND_THEME and BACKGROUND_THEME.lower() != "random" and BACKGROUND_THEME in GRADIENT_PALETTES:
+        name = BACKGROUND_THEME
+    if not name:
+        name = _ACTIVE_PALETTE_NAME[0]
+    if not name or name not in GRADIENT_PALETTES:
+        name = random.choice(list(GRADIENT_PALETTES.keys()))
+    _ACTIVE_PALETTE_NAME[0] = name
+    return name, GRADIENT_PALETTES[name]
+
+
+def text_accent_color():
+    """Cinematic text color matched to the active gradient palette."""
+    name = _ACTIVE_PALETTE_NAME[0]
+    if name and name in TEXT_ACCENTS:
+        return TEXT_ACCENTS[name] + (255,)
+    return DEFAULT_TEXT_ACCENT + (255,)
+
+
+def make_gradient_bg():
+    """Static gradient background built once (no per-frame flicker)."""
+    base = create_background()
+
+    def provider(t):
+        return base.copy()
+
+    return provider
+
+
 def create_background(t=None):
     """Gradient background (theme-aware) with vignette."""
-    if BACKGROUND_THEME and BACKGROUND_THEME.lower() != "random" and BACKGROUND_THEME in GRADIENT_PALETTES:
-        top_color, bottom_color = GRADIENT_PALETTES[BACKGROUND_THEME]
-    else:
-        top_color, bottom_color = random.choice(list(GRADIENT_PALETTES.values()))
+    name, (top_color, bottom_color) = pick_gradient_palette()
+    print(f"Gradient palette: {name}")
 
     background = Image.new("RGB", VIDEO_SIZE)
     draw = ImageDraw.Draw(background)
@@ -802,7 +839,7 @@ def resolve_background():
         mode = "gradient"
 
     if mode == "gradient":
-        return create_background, "gradient"
+        return make_gradient_bg(), "gradient"
 
     if mode == "image":
         p = _find_bg_file("image")
@@ -824,82 +861,7 @@ def resolve_background():
             except Exception as e:
                 print(f"WARNING: video background failed ({e}); using gradient.")
 
-    return create_background, "gradient"
-
-
-# ===================================================================
-# Neon border + stars (kept from the cinematic look)
-# ===================================================================
-
-def _hue_to_rgb(hue):
-    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, 1.0, 1.0)
-    return (int(r * 255), int(g * 255), int(b * 255))
-
-
-def _dimmed(color, factor):
-    return tuple(int(c * factor) for c in color)
-
-
-def _border_points(w, h, margin, segments=NEON_SEGMENTS):
-    pts = []
-    x0, y0, x1, y1 = margin, margin, w - margin, h - margin
-    for i in range(segments + 1):
-        pts.append((x0 + (x1 - x0) * i / segments, y0))
-    for i in range(1, segments + 1):
-        pts.append((x1, y0 + (y1 - y0) * i / segments))
-    for i in range(1, segments + 1):
-        pts.append((x1 - (x1 - x0) * i / segments, y1))
-    for i in range(1, segments + 1):
-        pts.append((x0, y1 - (y1 - y0) * i / segments))
-    return pts
-
-
-def draw_neon_border(draw, size, t):
-    """Slowly hue-cycling glowing border."""
-    pts = _border_points(size[0], size[1], NEON_MARGIN)
-    n = len(pts) - 1
-    offset = t * NEON_SPEED
-    for i in range(n):
-        color = _hue_to_rgb((i / n) + offset)
-        draw.line([pts[i], pts[i + 1]], fill=_dimmed(color, 0.4), width=NEON_GLOW)
-        draw.line([pts[i], pts[i + 1]], fill=color, width=NEON_THICK)
-
-
-def make_stars(size):
-    """Fixed positions for twinkling corner/edge stars."""
-    w, h = size
-    outer = max(NEON_MARGIN - 10, 6)
-    edge_margin = int(40 * RENDER_SCALE)
-    stars = []
-
-    def add(xs, ys):
-        for x, y in zip(xs, ys):
-            stars.append({
-                "x": x, "y": y,
-                "phase": random.uniform(0, math.tau),
-                "speed": random.uniform(1.2, 2.4),
-            })
-
-    xs = np.linspace(edge_margin, w - edge_margin, STARS_PER_SIDE)
-    add(xs, [outer] * STARS_PER_SIDE)
-    add(xs, [h - outer] * STARS_PER_SIDE)
-    ys = np.linspace(edge_margin, h - edge_margin, STARS_PER_SIDE)
-    add([outer] * STARS_PER_SIDE, ys)
-    add([w - outer] * STARS_PER_SIDE, ys)
-    return stars
-
-
-def draw_stars(draw, stars, t):
-    for s in stars:
-        brightness = 0.4 + 0.6 * (0.5 + 0.5 * math.sin(s["speed"] * t + s["phase"]))
-        size = (4 + 5 * brightness) * RENDER_SCALE
-        shade = int(255 * brightness)
-        color = (shade, shade, shade)
-        x, y = s["x"], s["y"]
-        line_w = max(1, int(2 * RENDER_SCALE))
-        draw.line([x - size, y, x + size, y], fill=color, width=line_w)
-        draw.line([x, y - size, x, y + size], fill=color, width=line_w)
-        draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=color)
+    return make_gradient_bg(), "gradient"
 
 
 def compute_block_top(block_height, safe_top=SAFE_TOP, safe_bottom=SAFE_BOTTOM, bias=VERTICAL_BIAS):
@@ -910,93 +872,76 @@ def compute_block_top(block_height, safe_top=SAFE_TOP, safe_bottom=SAFE_BOTTOM, 
 
 
 # ===================================================================
-# Page rendering: word-by-word entrance + hold + clean fade-out
+# Page rendering: line-by-line entrance (from top) + hold + fade
 # ===================================================================
 
-def render_page_words(lines, font, default_font_path):
-    """Flatten a page into per-word render info.
+def render_page_lines(lines, font, default_font_path):
+    """Render each line of a page as its own RGBA layer positioned at
+    the top of the safe area, so lines can animate in one-by-one.
 
-    Each word gets its own position on the page so it can animate in
-    independently (PPT-style entrance). Returns (words, block_info)
-    where each word is {text, x, y, font}.
+    Returns (line_layers, block_info); each entry is a dict with
+    {layer (PIL RGBA), x, y} pre-rendered at full opacity.
     """
     line_height = int(font.size * LINE_SPACING_MULTIPLIER)
     block_height = line_height * len(lines)
     top = compute_block_top(block_height)
 
-    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    words = []
+    text_fill = text_accent_color()
+    stroke_w = max(2, font.size // 24)
+    pad_x = int(font.size * 0.6)
+    pad_y = int(font.size * 0.9)
+    line_layers = []
     max_line_width = 0.0
+
+    measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
     for i, line in enumerate(lines):
         if not line.strip():
             continue
-        line_y = top + i * line_height
-        tokens = line.split(" ")
-        # Space width via the page font; per-word fonts may differ
-        space_w = measure.textlength(" ", font=font)
-        parts = []
-        for tok in tokens:
-            if not tok:
-                continue
-            parts.append(tok)
-        # measure total width with per-word fonts
-        widths = []
-        for tok in parts:
-            f = font_for_word(tok, font, default_font_path)
-            widths.append(measure.textlength(tok, font=f))
-        total_w = sum(widths) + space_w * (len(parts) - 1)
-        max_line_width = max(max_line_width, total_w)
-        x = (VIDEO_SIZE[0] - total_w) / 2
-        for tok, w in zip(parts, widths):
-            f = font_for_word(tok, font, default_font_path)
-            words.append({"text": tok, "x": x, "y": line_y, "font": f})
-            x += w + space_w
+        y = top + i * line_height
+        # measure with the page font (wrap already used it)
+        w = int(measure.textlength(line, font=font))
+        max_line_width = max(max_line_width, w)
+        x = (VIDEO_SIZE[0] - w) / 2
+
+        layer_w = w + pad_x * 2
+        layer_h = int(font.size * 2.2) + pad_y
+
+        shadow = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
+        sdraw = ImageDraw.Draw(shadow)
+        main = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
+        mdraw = ImageDraw.Draw(main)
+
+        tx = pad_x
+        ty = pad_y // 2
+        sdraw.text((tx + 2, ty + 2), line, font=font, fill=(0, 0, 0, 160))
+        sdraw.text((tx, ty + font.size * 0.08), line, font=font, fill=SHADOW_COLOR)
+        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=SHADOW_BLUR_RADIUS))
+        mdraw.text((tx, ty), line, font=font, fill=text_fill,
+                   stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
+
+        combined = Image.alpha_composite(shadow, main)
+        line_layers.append({
+            "layer": combined,
+            "x": int(x - pad_x),
+            "y": int(y - pad_y // 2),
+        })
 
     block_info = {"top": top, "height": block_height, "max_width": max_line_width}
-    return words, block_info
+    return line_layers, block_info
 
 
-def render_word_layer(word, opacity, rise_offset):
-    """Render one word as a small RGBA layer with shadow + stroke."""
-    f = word["font"]
-    pad = int(f.size * 0.6)
-    w_text = int(word.get("w", 0) or 0)
-    # measure if width missing
-    if w_text <= 0:
-        measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-        w_text = int(measure.textlength(word["text"], font=f))
-        word["w"] = w_text
-    layer_w = w_text + pad * 2
-    layer_h = int(f.size * 2.2)
-    ox = int(word["x"] - pad)
-    oy = int(word["y"] - rise_offset)
-    if ox < 0:
-        ox = 0
-    if oy < 0:
-        oy = 0
-
-    shadow = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
-    sdraw = ImageDraw.Draw(shadow)
-    main = Image.new("RGBA", (layer_w, layer_h), (0, 0, 0, 0))
-    mdraw = ImageDraw.Draw(main)
-    stroke_w = max(2, f.size // 22)
-
-    sx = pad
-    sy = int(f.size * 0.45)
-    sdraw.text((sx + 2, sy + 2), word["text"], font=f, fill=(0, 0, 0, 160))
-    sdraw.text((sx, sy + f.size * 0.08), word["text"], font=f, fill=SHADOW_COLOR)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=SHADOW_BLUR_RADIUS))
-
-    mdraw.text((sx, sy), word["text"], font=f, fill=TEXT_COLOR,
-              stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
-
-    combined = Image.alpha_composite(shadow, main)
-    if opacity < 1.0:
-        a = np.array(combined)
-        a[..., 3] = (a[..., 3].astype(np.float32) * opacity).astype(np.uint8)
-        combined = Image.fromarray(a)
-
-    return combined, ox, oy
+def apply_line_alpha(layer_img, alpha, rise_px):
+    """Fade + shift a pre-rendered line layer for its entrance."""
+    a = np.array(layer_img)
+    if alpha < 1.0:
+        a[..., 3] = (a[..., 3].astype(np.float32) * alpha).astype(np.uint8)
+    if rise_px > 0:
+        shifted = np.zeros_like(a)
+        r = int(round(rise_px))
+        if r > 0 and r < a.shape[0]:
+            shifted[r:, :, :] = a[:-r, :, :]
+        a = shifted
+    return a
 
 
 def composite_rgba_over_rgb(bg_rgb_arr, layer_rgba_arr):
@@ -1130,6 +1075,9 @@ def build_video(telugu_text, english_text, explanation_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
+    # Pick the gradient palette FIRST so text tint and background match
+    pick_gradient_palette()
+
     font_telugu_path = resolve_font_path(FONT_CANDIDATES_TELUGU, "telugu")
     font_latin_path = resolve_font_path(FONT_CANDIDATES_LATIN, "latin")
     if not font_telugu_path and (telugu_text or (explanation_text and is_telugu(explanation_text))):
@@ -1154,9 +1102,9 @@ def build_video(telugu_text, english_text, explanation_text):
     pages = []
     for p in raw_pages:
         default_font_path = font_telugu_path if p["font"] is font_telugu else font_latin_path
-        words, block_info = render_page_words(p["lines"], p["font"], default_font_path)
-        n_words = len(words)
-        if n_words == 0:
+        line_layers, block_info = render_page_lines(p["lines"], p["font"], default_font_path)
+        n_lines = len(line_layers)
+        if n_lines == 0:
             continue
         if block_info["max_width"] > SAFE_TEXT_WIDTH + 1:
             raise ValueError(
@@ -1164,8 +1112,8 @@ def build_video(telugu_text, english_text, explanation_text):
             )
         if block_info["top"] < SAFE_TOP - 1 or block_info["top"] + block_info["height"] > SAFE_BOTTOM + 1:
             raise ValueError(f"Text block falls outside the vertical safe area: {p['lines']!r}")
-        pages.append({"lines": p["lines"], "font": p["font"], "words": words,
-                      "n_words": n_words, "block": block_info})
+        pages.append({"lines": p["lines"], "font": p["font"], "line_layers": line_layers,
+                      "n_lines": n_lines, "block": block_info})
 
     if not pages:
         raise ValueError("No renderable text found after layout.")
@@ -1173,7 +1121,7 @@ def build_video(telugu_text, english_text, explanation_text):
     starts = schedule_pages(pages)
 
     print(f"Prepared {len(pages)} page(s) across {TOTAL_DURATION:.1f}s "
-          f"(word-by-word entrance, {HOLD_SECONDS}s hold, clean fade):")
+          f"(line-by-line entrance, {HOLD_SECONDS}s hold, clean fade):")
     for i, (p, s) in enumerate(zip(pages, starts)):
         preview = " / ".join(p["lines"])
         print(f"  Page {i + 1}: {s:5.2f}s -> {s + p['duration']:5.2f}s "
@@ -1181,7 +1129,6 @@ def build_video(telugu_text, english_text, explanation_text):
 
     bg_provider, bg_mode = resolve_background()
     print(f"Background mode: {bg_mode}")
-    stars = make_stars(VIDEO_SIZE)
 
     def make_frame(t):
         t = min(t, TOTAL_DURATION - 1e-3)
@@ -1190,9 +1137,6 @@ def build_video(telugu_text, english_text, explanation_text):
         local_t = t - starts[idx]
 
         frame_img = bg_provider(t)
-        frame_draw = ImageDraw.Draw(frame_img)
-        draw_neon_border(frame_draw, VIDEO_SIZE, t)
-        draw_stars(frame_draw, stars, t)
 
         # page-level fade-away factor at the very end
         fo = page["fade_out"]
@@ -1201,17 +1145,18 @@ def build_video(telugu_text, english_text, explanation_text):
             page_alpha = ease_out_cubic(max(0.0, (page["duration"] - local_t) / fo))
 
         if page_alpha > 0.01:
-            wf = page["word_fade"]
-            for wi, (word, w_start) in enumerate(zip(page["words"], page["word_starts"])):
-                wt = local_t - w_start
-                if wt <= 0:
+            lf = page["line_fade"]
+            for li, (line_layer, l_start) in enumerate(zip(page["line_layers"], page["line_starts"])):
+                lt = local_t - l_start
+                if lt <= 0:
                     continue
-                w_alpha = ease_out_cubic(min(1.0, wt / wf)) * page_alpha
-                if w_alpha <= 0.01:
+                prog = min(1.0, lt / lf)
+                l_alpha = ease_out_cubic(prog) * page_alpha
+                if l_alpha <= 0.01:
                     continue
-                rise = (1 - ease_out_cubic(min(1.0, wt / wf))) * WORD_RISE_PIXELS
-                layer, ox, oy = render_word_layer(word, w_alpha, rise)
-                frame_img.paste(layer, (ox, oy), layer)
+                rise = (1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS
+                arr = apply_line_alpha(line_layer["layer"], l_alpha, rise)
+                frame_img.paste(Image.fromarray(arr), (line_layer["x"], line_layer["y"]), Image.fromarray(arr))
 
         return np.array(frame_img)
 
@@ -1250,9 +1195,6 @@ def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_p
     thumb_size = (1280, 720)
     bg_img = _cover_resize(create_background().resize(
         (int(thumb_size[0] * 0.67), int(thumb_size[1] * 0.67)), _LANCZOS))
-    thumb_draw = ImageDraw.Draw(bg_img)
-    draw_neon_border(thumb_draw, thumb_size, t=0)
-    draw_stars(thumb_draw, make_stars(thumb_size), t=0)
 
     display_text = telugu_text or english_text or "Daily Bible Verse"
     use_telugu_font = is_telugu(display_text)
@@ -1270,11 +1212,12 @@ def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_p
 
     draw = ImageDraw.Draw(bg_img)
     stroke_w = max(1, font_size // 30)
+    text_fill = text_accent_color()
     for i, line in enumerate(lines):
         w = draw.textlength(line, font=font)
         x = (thumb_size[0] - w) / 2
         y = top + i * line_height
-        draw.text((x, y), line, font=font, fill=(255, 255, 255),
+        draw.text((x, y), line, font=font, fill=text_fill,
                   stroke_width=stroke_w, stroke_fill=(0, 0, 0))
 
     label_font = load_font(font_latin_path, int(font_size * 0.32))
@@ -1339,24 +1282,26 @@ def call_with_retries(func, max_retries=5, base_delay=5):
 
 
 def fetch_next_row(service):
+    """Fetch the FIRST unused row (strict queue: row 2, then 3, ...)."""
     range_ = f"{SHEET_TAB}!A2:D"
     result = call_with_retries(
         lambda: service.spreadsheets().values().get(spreadsheetId=SHEET_ID, range=range_).execute()
     )
     rows = result.get("values", [])
-    available = []
+    available_count = 0
     for i, row in enumerate(rows):
         telugu = row[0] if len(row) > 0 else ""
         english = row[1] if len(row) > 1 else ""
         explanation = row[2] if len(row) > 2 else ""
         used = row[3] if len(row) > 3 else ""
         if (telugu or english) and used.strip().lower() != "used":
-            available.append((i + 2, telugu.strip(), english.strip(), explanation.strip()))
+            available_count += 1
+            print(f"{available_count} unused row(s) available out of {len(rows)} total.")
+            print(f"Queue: selecting row {i + 2} (first unused).")
+            return (i + 2, telugu.strip(), english.strip(), explanation.strip())
 
-    print(f"{len(available)} unused row(s) available out of {len(rows)} total.")
-    if not available:
-        return None, None, None, None
-    return random.choice(available)
+    print(f"0 unused row(s) available out of {len(rows)} total.")
+    return None, None, None, None
 
 
 def mark_row_used(service, row_number):
