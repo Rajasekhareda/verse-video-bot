@@ -35,6 +35,9 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           PRIVACY_STATUS: private
+          # Background: gradient | image | gif | video (auto-detects the
+          # matching file in assets/backgrounds; gradient needs no file)
+          BACKGROUND_MODE: gradient
         run: python generate_video_pro.py
 
       - name: Upload output as workflow artifact (for debugging)
