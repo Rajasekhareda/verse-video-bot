@@ -113,13 +113,13 @@ if VIDEO_FORMAT in ("shorts", "vertical", "reels", "9:16"):
     SAFE_MARGIN_X_RATIO = 0.08
     SAFE_MARGIN_TOP_RATIO = 0.16      # clearance from top UI
     SAFE_MARGIN_BOTTOM_RATIO = 0.22   # clearance from bottom UI / captions
-    MAX_LINES = 4
+    MAX_LINES = 5
 else:
     VIDEO_SIZE = (1920, 1080)         # 16:9 Full HD Landscape
     SAFE_MARGIN_X_RATIO = 0.09
     SAFE_MARGIN_TOP_RATIO = 0.12
     SAFE_MARGIN_BOTTOM_RATIO = 0.14
-    MAX_LINES = 3
+    MAX_LINES = 4
 
 VERTICAL_BIAS = 0.0                   # centered vertically in safe area
 
@@ -129,14 +129,16 @@ SAFE_TOP = int(VIDEO_SIZE[1] * SAFE_MARGIN_TOP_RATIO)
 SAFE_BOTTOM = int(VIDEO_SIZE[1] * (1 - SAFE_MARGIN_BOTTOM_RATIO))
 SAFE_TEXT_WIDTH = int((SAFE_RIGHT - SAFE_LEFT) * 0.96)
 
-# ============ LINE ANIMATION & EASING ============
-LINE_FADE = 0.80           # seconds for each line to smoothly fade in
-LINE_STAGGER = 0.55        # seconds between consecutive line starts
-LINE_RISE_PIXELS = 18      # gentle upward float (pixels)
-ENTRANCE_CAP = 5.5         # max seconds for a page's entrance
-HOLD_SECONDS = 5.5         # base hold duration after entrance
-PAGE_FADE_OUT = 0.80       # clean dissolve duration at page end
-MIN_PAGE_DURATION = 3.5    # minimum allowed duration per slide
+# ============ LINE ANIMATION & SYNCHRONIZATION TIMING ============
+SPEECH_START_OFFSET = 0.4   # seconds after slide entrance before speech starts
+HOLD_AFTER_SPEECH = 2.0     # seconds text holds after speech finishes before fading out
+PAGE_FADE_OUT = 0.70        # clean dissolve duration at page end
+LINE_FADE = 0.75            # seconds for each line to smoothly fade in
+LINE_STAGGER = 0.50         # seconds between consecutive line starts
+LINE_RISE_PIXELS = 18       # gentle upward float (pixels)
+ENTRANCE_CAP = 4.5          # max seconds for a page's entrance
+HOLD_SECONDS = 5.0          # base hold duration (when no voiceover)
+MIN_PAGE_DURATION = 4.0     # minimum allowed duration per slide
 
 # Typography & Colors
 GOLD_ACCENT = (250, 218, 94)          # Radiant warm gold (headers, book tags)
@@ -514,73 +516,72 @@ def build_segments(telugu_text, english_text, explanation_text, font_telugu, fon
 # ===================================================================
 
 def schedule_pages(pages, audio_clips=None):
-    """Assign durations summing to exactly TOTAL_DURATION.
-    If TTS audio clips are available, the page durations dynamically
-    synchronize with the spoken narration!
+    """Assign durations guaranteeing 100% audio-visual synchronization:
+    1. A page NEVER ends or fades while speech is still active.
+    2. Speech finishes completely + holds for at least HOLD_AFTER_SPEECH before fade-out.
+    3. Extra video time is distributed into reading holds, never compressing speech.
+    4. If narration requires more than TOTAL_DURATION, video naturally extends to fit.
     """
     n = len(pages)
     if n == 0:
-        return []
+        return [], TOTAL_DURATION
 
-    # Calculate desired duration per page
+    # Step 1: Calculate the absolute minimum safe duration for each page
+    min_durs = []
     for i, p in enumerate(pages):
-        nl = max(1, p["n_lines"])
-        entrance = min(ENTRANCE_CAP, (nl - 1) * LINE_STAGGER + LINE_FADE)
-        p["entrance"] = entrance
-        p["fade_out"] = PAGE_FADE_OUT
-
+        speech_dur = 0.0
         if audio_clips and i < len(audio_clips) and audio_clips[i]:
-            # Page matches speech duration + 1.2s contemplation hold
-            speech_dur = audio_clips[i].duration
-            p["raw"] = max(MIN_PAGE_DURATION, speech_dur + 1.2 + PAGE_FADE_OUT)
+            speech_dur = float(audio_clips[i].duration)
+            p["speech_dur"] = speech_dur
+            p["speech_start"] = SPEECH_START_OFFSET
+            # Slide duration MUST cover: speech_start + speech_dur + hold_after_speech + fade_out
+            safe_min = SPEECH_START_OFFSET + speech_dur + HOLD_AFTER_SPEECH + PAGE_FADE_OUT
         else:
-            p["raw"] = entrance + HOLD_SECONDS + PAGE_FADE_OUT
+            p["speech_dur"] = 0.0
+            p["speech_start"] = 0.0
+            nl = max(1, p["n_lines"])
+            entrance = min(ENTRANCE_CAP, (nl - 1) * LINE_STAGGER + LINE_FADE)
+            safe_min = entrance + HOLD_SECONDS + PAGE_FADE_OUT
 
-    total_raw = sum(p["raw"] for p in pages)
-    scale = TOTAL_DURATION / total_raw
-    durs = [p["raw"] * scale for p in pages]
+        safe_min = max(MIN_PAGE_DURATION, safe_min)
+        p["min_duration"] = safe_min
+        min_durs.append(safe_min)
 
-    # Constrain to min page duration
-    for _ in range(3):
-        tight = [i for i, d in enumerate(durs) if d < MIN_PAGE_DURATION]
-        if not tight:
-            break
-        for i in tight:
-            durs[i] = MIN_PAGE_DURATION
-        free = [i for i, d in enumerate(durs) if d > MIN_PAGE_DURATION]
-        if not free:
-            durs = [TOTAL_DURATION / n] * n
-            break
-        free_sum = TOTAL_DURATION - MIN_PAGE_DURATION * len(tight)
-        sub = sum(durs[i] for i in free)
-        if sub <= 0:
-            durs = [TOTAL_DURATION / n] * n
-            break
-        for i in free:
-            durs[i] *= free_sum / sub
+    min_total = sum(min_durs)
 
-    total = sum(durs)
-    durs = [d * TOTAL_DURATION / total for d in durs]
+    # Step 2: Determine actual video duration and allocate any slack into holds
+    actual_total_duration = max(TOTAL_DURATION, min_total)
+    slack = actual_total_duration - min_total
 
+    # Distribute slack proportionally to page length
+    durs = []
+    for safe_min in min_durs:
+        if min_total > 0 and slack > 0:
+            extra = slack * (safe_min / min_total)
+        else:
+            extra = 0.0
+        durs.append(safe_min + extra)
+
+    # Step 3: Compute exact start times and animation params
     starts = []
     acc = 0.0
     for p, d in zip(pages, durs):
         p["duration"] = d
-        f = d / p["raw"]
-        p["fade_out"] = max(0.2, min(PAGE_FADE_OUT, d * 0.25))
-        p["entrance"] = max(0.3, min(p["entrance"] * f, d - p["fade_out"] - 0.2))
-        lf = max(0.25, min(LINE_FADE, p["entrance"] * 0.65))
-        p["line_fade"] = lf
+        p["fade_out"] = PAGE_FADE_OUT
         nl = p["n_lines"]
+        p["entrance"] = min(ENTRANCE_CAP, max(1.2, (nl - 1) * LINE_STAGGER + LINE_FADE))
+        lf = min(LINE_FADE, p["entrance"] * 0.7)
+        p["line_fade"] = lf
         if nl > 1:
-            stagger = max(0.05, (p["entrance"] - lf) / (nl - 1))
+            stagger = (p["entrance"] - lf) / (nl - 1)
         else:
             stagger = 0.0
         p["line_starts"] = [i * stagger for i in range(nl)]
         starts.append(acc)
         acc += d
 
-    return starts
+    return starts, actual_total_duration
+
 
 # ===================================================================
 # Background Engine: Nature Scenery, Ken Burns, Video Loops, Celestial
@@ -633,7 +634,7 @@ def _apply_scrim(img, dim_factor=IMAGE_DIM):
     return Image.composite(dimmed, Image.new("RGB", (w, h), (0, 0, 0)), _get_cinematic_scrim())
 
 
-def make_ken_burns_image_bg(path):
+def make_ken_burns_image_bg(path, duration=TOTAL_DURATION):
     """Cinematic Ken Burns camera motion over high-res scenery:
     Slow, regal drone-like pan across the image at 60+ fps rendering speed.
     """
@@ -651,7 +652,7 @@ def make_ken_burns_image_bg(path):
     black = Image.new("RGB", (w, h), (0, 0, 0))
 
     def provider(t):
-        p = t / max(1.0, TOTAL_DURATION)
+        p = t / max(1.0, duration)
         # Gentle smooth easing for camera sweep
         eased_p = smooth_ease(p)
         cx = int(max_x * (0.2 + 0.6 * eased_p))
@@ -790,7 +791,7 @@ def _find_matching_bg_file(theme_filter=None):
     return None, None
 
 
-def resolve_background():
+def resolve_background(duration=TOTAL_DURATION):
     """Returns (provider_function, mode_name) based on configuration and files."""
     theme = BACKGROUND_THEME if BACKGROUND_THEME != "random" else None
 
@@ -803,10 +804,10 @@ def resolve_background():
 
     if BACKGROUND_MODE == "image":
         if BACKGROUND_IMAGE and os.path.isfile(BACKGROUND_IMAGE):
-            return make_ken_burns_image_bg(BACKGROUND_IMAGE), "image"
+            return make_ken_burns_image_bg(BACKGROUND_IMAGE, duration=duration), "image"
         path, kind = _find_matching_bg_file(theme)
         if path:
-            return make_ken_burns_image_bg(path), f"image ({os.path.basename(path)})"
+            return make_ken_burns_image_bg(path, duration=duration), f"image ({os.path.basename(path)})"
 
     if BACKGROUND_MODE == "celestial":
         return make_celestial_bg(), "celestial"
@@ -822,7 +823,7 @@ def resolve_background():
             return make_video_bg(path), f"video ({os.path.basename(path)})"
         else:
             print(f"Loaded cinematic scenery background: {os.path.basename(path)}")
-            return make_ken_burns_image_bg(path), f"image ({os.path.basename(path)})"
+            return make_ken_burns_image_bg(path, duration=duration), f"image ({os.path.basename(path)})"
 
     # Fallback to rich celestial motion
     print("Using celestial ambient motion background.")
@@ -1160,21 +1161,21 @@ def build_video(telugu_text, english_text, explanation_text):
 
     # Generate TTS audio narration (Edge-TTS)
     tts_audio_clips = create_tts_clips(pages)
-    starts = schedule_pages(pages, tts_audio_clips)
+    starts, actual_duration = schedule_pages(pages, tts_audio_clips)
 
-    print(f"\nPrepared {len(pages)} slide(s) across {TOTAL_DURATION:.1f}s:")
+    print(f"\nPrepared {len(pages)} slide(s) across {actual_duration:.1f}s:")
     for i, (p, s) in enumerate(zip(pages, starts)):
         preview = " / ".join(p["lines"])
-        has_tts = "Narration ON" if (tts_audio_clips and tts_audio_clips[i]) else "Music only"
+        has_tts = f"Narration: {p['speech_dur']:.1f}s" if (tts_audio_clips and tts_audio_clips[i]) else "Music only"
         print(f"  Slide {i + 1}: {s:5.2f}s -> {s + p['duration']:5.2f}s "
               f"({p['duration']:4.2f}s, entrance {p['entrance']:.2f}s) [{has_tts}] {preview}")
 
     # Resolve Background (Scenery / Video / Celestial / Gradient)
-    bg_provider, bg_mode = resolve_background()
+    bg_provider, bg_mode = resolve_background(duration=actual_duration)
     print(f"\nCinematic Background Mode: {bg_mode}")
 
     def make_frame(t):
-        t = min(t, TOTAL_DURATION - 1e-3)
+        t = min(t, actual_duration - 1e-3)
         idx = max(0, min(bisect_right(starts, t) - 1, len(pages) - 1))
         page = pages[idx]
         local_t = t - starts[idx]
@@ -1205,20 +1206,20 @@ def build_video(telugu_text, english_text, explanation_text):
 
         return np.array(frame_img)
 
-    clip = VideoClip(make_frame, duration=TOTAL_DURATION)
+    clip = VideoClip(make_frame, duration=actual_duration)
     clip = _compat(clip, "with_fps", "set_fps", FPS)
 
     # Composite audio (Music + Synchronized Narration)
     try:
         music_path = pick_music_file()
         has_narration = any(c is not None for c in tts_audio_clips)
-        music_clip = prepare_audio(music_path, TOTAL_DURATION, has_voiceover=has_narration)
+        music_clip = prepare_audio(music_path, actual_duration, has_voiceover=has_narration)
 
         timed_audio_clips = [music_clip]
         for c, s in zip(tts_audio_clips, starts):
             if c is not None:
                 # Synchronize voice start with text float entrance
-                c_timed = _compat(c, "with_start", "set_start", s + 0.3)
+                c_timed = _compat(c, "with_start", "set_start", s + SPEECH_START_OFFSET)
                 timed_audio_clips.append(c_timed)
 
         composite_audio = CompositeAudioClip(timed_audio_clips)
