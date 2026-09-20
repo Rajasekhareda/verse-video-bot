@@ -97,8 +97,10 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
 
 # TTS Configuration
 ENABLE_TTS = os.environ.get("ENABLE_TTS", "yes").strip().lower() in ("yes", "true", "1", "auto")
-VOICE_TELUGU = os.environ.get("VOICE_TELUGU", "te-IN-MohanNeural").strip()
+TTS_PROVIDER = os.environ.get("TTS_PROVIDER", "auto").strip().lower()
+VOICE_TELUGU = os.environ.get("VOICE_TELUGU", "te-IN-ShrutiNeural").strip()
 VOICE_ENGLISH = os.environ.get("VOICE_ENGLISH", "en-US-ChristopherNeural").strip()
+SPEAK_REFERENCE = os.environ.get("SPEAK_REFERENCE", "no").strip().lower() in ("yes", "true", "1")
 
 OUTPUT_DIR = "output"
 THUMBNAIL_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
@@ -992,16 +994,71 @@ def apply_line_alpha(layer_img, alpha, rise_px):
 # Neural Voice-Over (TTS): Edge-TTS & ElevenLabs
 # ===================================================================
 
+def clean_text_for_speech(text):
+    """Cleans text so speech sounds completely natural, warm, and human:
+    - Removes brackets and colons that make TTS stutter or pronounce 'bracket'
+    - By default, keeps pure holy scripture in speech while reference is displayed in radiant gold on screen
+    """
+    if not text:
+        return ""
+    cleaned = text
+    match = re.search(r"\s*\(([^()]+)\)\s*$", cleaned)
+    if match:
+        if SPEAK_REFERENCE:
+            ref_part = match.group(1).strip()
+            verse_body = cleaned[:match.start()].strip()
+            cleaned = f"{verse_body}. {ref_part}."
+        else:
+            cleaned = cleaned[:match.start()].strip()
+
+    cleaned = re.sub(r"[\[\]\(\)\*#_~`\"']", "", cleaned)
+    cleaned = cleaned.replace(";", ",").replace(":", " ")
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 async def _edge_tts_speak(text, voice, output_file):
-    communicate = edge_tts.Communicate(text, voice=voice, rate="-4%")
+    # Natural rate and pitch contour preserves human storytelling cadence
+    communicate = edge_tts.Communicate(text, voice=voice, rate="+0%", pitch="+0Hz")
     await communicate.save(output_file)
 
 
-def generate_tts_audio(text, language):
-    """Generates crystal-clear neural narration using free Edge-TTS (or ElevenLabs)."""
-    if not ENABLE_TTS:
+def generate_google_tts(text, language):
+    """Generates speech via Google Cloud Text-to-Speech (Wavenet) if GCP credentials are present."""
+    sa_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json:
         return None
-    if not text or not text.strip():
+    try:
+        import base64
+        sa_info = json.loads(sa_json)
+        sa_creds = service_account.Credentials.from_service_account_info(
+            sa_info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+        service = build("texttospeech", "v1", credentials=sa_creds)
+        lang_code = "te-IN" if language == "telugu" else "en-US"
+        voice_name = "te-IN-Wavenet-A" if language == "telugu" else "en-US-Journey-F"
+
+        body = {
+            "input": {"text": text},
+            "voice": {"languageCode": lang_code, "name": voice_name},
+            "audioConfig": {"audioEncoding": "MP3", "speakingRate": 0.95}
+        }
+        resp = service.text().synthesize(body=body).execute()
+        audio_content = resp.get("audioContent")
+        if audio_content:
+            decoded = base64.b64decode(audio_content)
+            fd, tmp = tempfile.mkstemp(suffix=".mp3")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(decoded)
+            return tmp
+    except Exception as e:
+        print(f"Google Cloud TTS not active or failed ({e}); using Edge-TTS...")
+        return None
+
+
+def generate_tts_audio(text, language):
+    """Generates crystal-clear neural narration using free Edge-TTS (or ElevenLabs / Google Cloud)."""
+    if not ENABLE_TTS or not text or not text.strip():
         return None
 
     # Try ElevenLabs first if API key is provided
@@ -1017,9 +1074,15 @@ def generate_tts_audio(text, language):
                     fh.write(resp.content)
                 return tmp
         except Exception as e:
-            print(f"ElevenLabs TTS failed ({e}); falling back to Edge-TTS...")
+            print(f"ElevenLabs TTS failed ({e}); falling back...")
 
-    # Edge-TTS (Free, no API key needed, studio neural quality)
+    # Try Google Cloud TTS if explicitly chosen
+    if TTS_PROVIDER == "google":
+        g_tmp = generate_google_tts(text, language)
+        if g_tmp:
+            return g_tmp
+
+    # Edge-TTS (Free, studio neural quality with Shruti/Mohan)
     if _HAS_EDGE_TTS:
         try:
             fd, tmp = tempfile.mkstemp(suffix=".mp3")
@@ -1041,10 +1104,12 @@ def create_tts_clips(pages):
 
     clips = []
     for i, p in enumerate(pages):
-        text = p.get("raw_text", " ".join(p["lines"]))
-        lang = detect_language(text)
-        print(f"Generating narration ({lang}) for Page {i + 1}: {text[:45]}...")
-        audio_path = generate_tts_audio(text, lang)
+        raw_text = p.get("raw_text", " ".join(p["lines"]))
+        lang = detect_language(raw_text)
+        spoken_text = clean_text_for_speech(raw_text)
+        voice_used = VOICE_TELUGU if lang == "telugu" else VOICE_ENGLISH
+        print(f"Generating natural narration ({lang} - {voice_used}) for Page {i + 1}: {spoken_text[:45]}...")
+        audio_path = generate_tts_audio(spoken_text, lang)
         if audio_path and os.path.isfile(audio_path):
             try:
                 clip = AudioFileClip(audio_path)

@@ -35,6 +35,14 @@ on:
         type: choice
         options: [Yes, No]
         default: Yes
+      telugu_voice:
+        description: "Telugu Voice Model"
+        required: true
+        type: choice
+        options:
+          - te-IN-ShrutiNeural
+          - te-IN-MohanNeural
+        default: te-IN-ShrutiNeural
       privacy:
         description: "YouTube Privacy Status"
         required: true
@@ -78,6 +86,7 @@ jobs:
           BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
           VIDEO_FORMAT: ${{ inputs.video_format || 'landscape' }}
           ENABLE_TTS: ${{ inputs.enable_tts || 'Yes' }}
+          VOICE_TELUGU: ${{ inputs.telugu_voice || 'te-IN-ShrutiNeural' }}
         run: python generate_video_pro.py
 
       - name: Upload output as workflow artifact (for debugging)
