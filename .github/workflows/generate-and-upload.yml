@@ -1,7 +1,46 @@
-﻿name: Generate and Upload Verse Video
+name: Generate and Upload Verse Video
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      background_theme:
+        description: "Cinematic Background Theme"
+        required: true
+        type: choice
+        options:
+          - Random
+          - Mountains
+          - Ocean
+          - Waterfall
+          - Forest
+          - Desert
+          - Sky
+          - Celestial
+        default: Random
+      background_mode:
+        description: "Background Source Mode"
+        required: true
+        type: choice
+        options: [auto, image, video, celestial, gradient]
+        default: auto
+      video_format:
+        description: "Video Aspect Ratio"
+        required: true
+        type: choice
+        options: [landscape, shorts]
+        default: landscape
+      enable_tts:
+        description: "Enable Automatic Voice-Over (Telugu + English)?"
+        required: true
+        type: choice
+        options: [Yes, No]
+        default: Yes
+      privacy:
+        description: "YouTube Privacy Status"
+        required: true
+        type: choice
+        options: [private, unlisted, public]
+        default: private
   schedule:
     - cron: "0 3 * * *"
 
@@ -34,10 +73,11 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
-          PRIVACY_STATUS: private
-          # Background: gradient | image | gif | video (auto-detects the
-          # matching file in assets/backgrounds; gradient needs no file)
-          BACKGROUND_MODE: gradient
+          PRIVACY_STATUS: ${{ inputs.privacy || 'private' }}
+          BACKGROUND_MODE: ${{ inputs.background_mode || 'auto' }}
+          BACKGROUND_THEME: ${{ inputs.background_theme || 'Random' }}
+          VIDEO_FORMAT: ${{ inputs.video_format || 'landscape' }}
+          ENABLE_TTS: ${{ inputs.enable_tts || 'Yes' }}
         run: python generate_video_pro.py
 
       - name: Upload output as workflow artifact (for debugging)

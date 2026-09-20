@@ -4,24 +4,22 @@ generate_video_pro.py
 Cinematic 45-second YouTube Bible-verse video generator.
 
 Features:
+    - Cinematic Nature & Video Backgrounds: Mountains, Ocean, Waterfall,
+      Forest, Desert, Sky, Sea Life, and Celestial themes with Ken Burns motion
+    - Smooth Typography Animation: Hermite smoothstep easing, gentle upward float,
+      dual-tone ivory/gold devotional palette with soft ambient shadow
+    - Automated Neural Voice-Over (Free Edge-TTS + ElevenLabs fallback):
+      Telugu (te-IN-MohanNeural) & English (en-US-ChristopherNeural)
+    - Dynamic Audio Synchronization: Page duration adapts naturally to narration
+    - Background Music with Smart Narration Ducking
+    - Landscape (16:9) and Shorts/Reels (9:16) aspect ratio support
     - Google Sheets integration: Column A = Telugu, B = English,
       C = explanation, D = "used" marker written back automatically
-    - Word-by-word PowerPoint-style entrance animation,
-      6-second hold, then a clean fade-away before the next page
-    - Selectable backgrounds: gradient (default), image, GIF, or video
-    - Telugu + English (plus any installed script) with no tofu
-      boxes: bundled merged Noto Serif font first, per-script system
-      font fallback via fontTools coverage checks
-    - Background music loops to fill the full 45 seconds exactly
-    - Optional ElevenLabs TTS narration synchronized with pages
-    - YouTube thumbnail generation and private upload
-
-Pipeline:
-    Google Sheet -> render 45s video with word-by-word animated text ->
-    loop music to exactly 45s -> upload to YouTube
+    - High-definition YouTube thumbnail generation and automated upload
 """
 
 import argparse
+import asyncio
 import atexit
 import glob
 import json
@@ -58,6 +56,19 @@ except ImportError:
 
 import requests
 
+try:
+    import edge_tts
+    _HAS_EDGE_TTS = True
+except ImportError:
+    _HAS_EDGE_TTS = False
+
+try:
+    import uharfbuzz as _hb
+    import freetype as _ft
+    _HAS_HARFBUZZ = True
+except ImportError:
+    _HAS_HARFBUZZ = False
+
 # Windows consoles default to cp1252; make all Telugu/Unicode prints safe
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -71,31 +82,46 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-# ================= SHEET LAYOUT =================
+# ================= SHEET LAYOUT & ENV VARS =================
 # Column A = Telugu verse text
 # Column B = English verse text
 # Column C = optional brief explanation/note (any language)
 # Column D = "used" marker, written automatically by this script
-# ==================================================
+# ==========================================================
 
 SHEET_ID = os.environ.get("SHEET_ID", "")
 SHEET_TAB = os.environ.get("SHEET_TAB", "Sheet1")
 MUSIC_DIR = os.environ.get("MUSIC_DIR", "assets/music")
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+BACKGROUND_DIR = os.environ.get("BACKGROUND_DIR", "assets/backgrounds")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+
+# TTS Configuration
+ENABLE_TTS = os.environ.get("ENABLE_TTS", "yes").strip().lower() in ("yes", "true", "1", "auto")
+VOICE_TELUGU = os.environ.get("VOICE_TELUGU", "te-IN-MohanNeural").strip()
+VOICE_ENGLISH = os.environ.get("VOICE_ENGLISH", "en-US-ChristopherNeural").strip()
 
 OUTPUT_DIR = "output"
 THUMBNAIL_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 
-# ================= VIDEO SPEC ================
-FPS = 30
-VIDEO_SIZE = (1920, 1080)          # 16:9 Full HD
-TOTAL_DURATION = 45.0              # exact video length, seconds
-MAX_LINES = 3                      # hard cap per page
+# ================= VIDEO & FORMAT SPEC ================
+VIDEO_FORMAT = os.environ.get("VIDEO_FORMAT", "landscape").strip().lower()
+FPS = int(os.environ.get("FPS", "30"))
+TOTAL_DURATION = float(os.environ.get("TOTAL_DURATION", "45.0"))
 
-SAFE_MARGIN_X_RATIO = 0.09
-SAFE_MARGIN_TOP_RATIO = 0.12
-SAFE_MARGIN_BOTTOM_RATIO = 0.14
-VERTICAL_BIAS = 0.0                # text block starts at TOP of safe area
+if VIDEO_FORMAT in ("shorts", "vertical", "reels", "9:16"):
+    VIDEO_SIZE = (1080, 1920)         # 9:16 Portrait for Shorts / Reels
+    SAFE_MARGIN_X_RATIO = 0.08
+    SAFE_MARGIN_TOP_RATIO = 0.16      # clearance from top UI
+    SAFE_MARGIN_BOTTOM_RATIO = 0.22   # clearance from bottom UI / captions
+    MAX_LINES = 4
+else:
+    VIDEO_SIZE = (1920, 1080)         # 16:9 Full HD Landscape
+    SAFE_MARGIN_X_RATIO = 0.09
+    SAFE_MARGIN_TOP_RATIO = 0.12
+    SAFE_MARGIN_BOTTOM_RATIO = 0.14
+    MAX_LINES = 3
+
+VERTICAL_BIAS = 0.0                   # centered vertically in safe area
 
 SAFE_LEFT = int(VIDEO_SIZE[0] * SAFE_MARGIN_X_RATIO)
 SAFE_RIGHT = int(VIDEO_SIZE[0] * (1 - SAFE_MARGIN_X_RATIO))
@@ -103,53 +129,42 @@ SAFE_TOP = int(VIDEO_SIZE[1] * SAFE_MARGIN_TOP_RATIO)
 SAFE_BOTTOM = int(VIDEO_SIZE[1] * (1 - SAFE_MARGIN_BOTTOM_RATIO))
 SAFE_TEXT_WIDTH = int((SAFE_RIGHT - SAFE_LEFT) * 0.96)
 
-# ============ LINE-BY-LINE ANIMATION TIMING ============
-# Each page: lines enter one-by-one from the top of the screen,
-# the completed text holds, then fades away cleanly.
-LINE_FADE = 0.5           # seconds for each line to fade in
-LINE_STAGGER = 0.75       # seconds between consecutive line starts
-LINE_RISE_PIXELS = 24     # each line rises slightly as it appears
-ENTRANCE_CAP = 6.0        # max seconds for a page's full entrance
-HOLD_SECONDS = 6.0        # text holds this long after entrance
-PAGE_FADE_OUT = 0.9       # clean fade-away duration at page end
-MIN_PAGE_DURATION = 3.0   # never squeeze a page below this
+# ============ LINE ANIMATION & EASING ============
+LINE_FADE = 0.80           # seconds for each line to smoothly fade in
+LINE_STAGGER = 0.55        # seconds between consecutive line starts
+LINE_RISE_PIXELS = 18      # gentle upward float (pixels)
+ENTRANCE_CAP = 5.5         # max seconds for a page's entrance
+HOLD_SECONDS = 5.5         # base hold duration after entrance
+PAGE_FADE_OUT = 0.80       # clean dissolve duration at page end
+MIN_PAGE_DURATION = 3.5    # minimum allowed duration per slide
 
-# Typography
-SHADOW_COLOR = (0, 0, 0, 220)
-STROKE_COLOR = (20, 20, 30, 200)
+# Typography & Colors
+GOLD_ACCENT = (250, 218, 94)          # Radiant warm gold (headers, book tags)
+CREAM_WHITE = (255, 252, 246)         # Spiritual ivory white (primary verse text)
+SHADOW_COLOR = (0, 0, 0, 220)         # Deep ambient drop shadow
+STROKE_COLOR = (14, 14, 20, 210)       # Crisp contrast outline
 SHADOW_BLUR_RADIUS = 6
 LINE_SPACING_MULTIPLIER = 1.45
 
-# Cinematic text accents matched to each gradient palette
-TEXT_ACCENTS = {
-    "Midnight Purple": (232, 225, 255),   # soft lavender-white
-    "Ocean Blue":      (214, 236, 255),   # ice-blue white
-    "Wine Red":        (255, 226, 229),   # rose white
-    "Emerald Teal":    (222, 255, 244),   # mint white
-    "Sunset Amber":    (255, 236, 204),   # warm amber cream
-    "Indigo Violet":   (228, 224, 255),   # periwinkle white
-    "Midnight Slate":  (233, 240, 247),   # silver-blue white
-    "Charcoal":        (250, 246, 238),   # warm cream
-}
-DEFAULT_TEXT_ACCENT = (255, 244, 224)  # warm cinematic cream-gold
+# ============ BACKGROUND MODES & THEMES ============
+# Modes: auto | video | image | gif | celestial | gradient
+BACKGROUND_MODE = os.environ.get("BACKGROUND_MODE", "auto").strip().lower()
+# Themes: random | mountains | ocean | waterfall | forest | desert | sky | celestial
+BACKGROUND_THEME = os.environ.get("BACKGROUND_THEME", "random").strip().lower()
 
-# ============ BACKGROUNDS ============
-# BACKGROUND_MODE: gradient | image | gif | video
-BACKGROUND_MODE = (os.environ.get("BACKGROUND_MODE", "gradient").strip().lower()
-                   or "gradient")
-BACKGROUND_DIR = os.environ.get("BACKGROUND_DIR", "assets/backgrounds")
 BACKGROUND_IMAGE = os.environ.get("BACKGROUND_IMAGE", "").strip()
 BACKGROUND_GIF = os.environ.get("BACKGROUND_GIF", "").strip()
 BACKGROUND_VIDEO = os.environ.get("BACKGROUND_VIDEO", "").strip()
-IMAGE_DIM = 0.45          # darken still/gif backgrounds for text contrast
-VIDEO_DIM = 0.50          # darken video backgrounds for text contrast
-GIF_FRAME_CAP = 20        # max precomputed GIF frames (memory cap)
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "").strip()
+
+IMAGE_DIM = 0.40          # scenery dimming factor
+VIDEO_DIM = 0.45          # video background dimming factor
+GIF_FRAME_CAP = 25
 
 # Manual-run controls
 PRIVACY_STATUS = os.environ.get("PRIVACY_STATUS", "private").strip().lower()
 MUSIC_CHOICE = os.environ.get("MUSIC_CHOICE", "random").strip()
-BACKGROUND_THEME = os.environ.get("BACKGROUND_THEME", "random").strip()
-INCLUDE_EXPLANATION = os.environ.get("INCLUDE_EXPLANATION", "Auto").strip().lower()
+INCLUDE_EXPLANATION = os.environ.get("INCLUDE_EXPLANATION", "auto").strip().lower()
 TELUGU_OVERRIDE = os.environ.get("TELUGU_OVERRIDE", "").strip()
 ENGLISH_OVERRIDE = os.environ.get("ENGLISH_OVERRIDE", "").strip()
 EXPLANATION_OVERRIDE = os.environ.get("EXPLANATION_OVERRIDE", "").strip()
@@ -158,32 +173,32 @@ FONT_PATH_TELUGU_ENV = os.environ.get("FONT_PATH_TELUGU", "").strip()
 FONT_PATH_LATIN_ENV = os.environ.get("FONT_PATH_LATIN", "").strip()
 
 GRADIENT_PALETTES = {
-    "Midnight Purple": ((18, 12, 52), (46, 22, 74)),
-    "Ocean Blue":       ((8, 30, 70), (16, 55, 96)),
-    "Wine Red":         ((36, 8, 20), (72, 22, 42)),
-    "Emerald Teal":     ((8, 38, 36), (14, 66, 60)),
-    "Sunset Amber":     ((40, 20, 10), (86, 46, 20)),
-    "Indigo Violet":    ((20, 14, 50), (48, 34, 96)),
-    "Midnight Slate":   ((14, 20, 34), (26, 38, 60)),
-    "Charcoal":         ((16, 16, 20), (30, 30, 36)),
+    "Midnight Purple": ((16, 10, 48), (42, 18, 70)),
+    "Ocean Blue":       ((6, 26, 64), (14, 52, 92)),
+    "Wine Red":         ((34, 6, 18), (68, 20, 38)),
+    "Emerald Teal":     ((6, 36, 32), (12, 64, 58)),
+    "Sunset Amber":     ((38, 18, 8), (82, 42, 18)),
+    "Indigo Violet":    ((18, 12, 46), (44, 30, 90)),
+    "Midnight Slate":   ((12, 18, 30), (24, 36, 56)),
+    "Charcoal":         ((14, 14, 18), (28, 28, 34)),
 }
 
 BASE_HASHTAGS = ["#BibleVerse", "#DailyVerse", "#Faith", "#God", "#Jesus", "#Scripture"]
-TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#Telugu"]
-ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod"]
+TELUGU_HASHTAGS = ["#TeluguChristian", "#YesuKrishtu", "#TeluguBible"]
+ENGLISH_HASHTAGS = ["#Christian", "#Gospel", "#WordOfGod", "#FaithJourney"]
 
-# Bundled font covers Telugu + Latin (98 Telugu, 95 Latin glyphs verified)
+# Bundled font covers Telugu + Latin
 _REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 _BUNDLED_FONT = os.path.join(_REPO_DIR, "NotoSerifMerged-Bold.ttf")
 
 FONT_CANDIDATES_TELUGU = [p for p in [
     FONT_PATH_TELUGU_ENV,
-    _BUNDLED_FONT,
+    r"C:\Windows\Fonts\NirmalaB.ttf",
+    r"C:\Windows\Fonts\Nirmala.ttf",
     "/usr/share/fonts/truetype/noto/NotoSerifTelugu-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Bold.ttf",
     "/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf",
-    r"C:\Windows\Fonts\NirmalaB.ttf",
-    r"C:\Windows\Fonts\Nirmala.ttf",
+    _BUNDLED_FONT,
     "/System/Library/Fonts/Supplemental/NotoSansTelugu-Regular.ttf",
     "/Library/Fonts/NotoSansTelugu-Regular.ttf",
 ] if p and os.path.isfile(p)]
@@ -213,26 +228,35 @@ _FONT_SCAN_PATTERNS = {
               "*DejaVuSans*Bold*.ttf", "*Segoe*.ttf", "*Arial*Bold*.ttf", "*.ttf"],
 }
 
-# Script ranges for per-word font fallback (avoids tofu boxes for any
-# language whose font is installed on the system)
 _SCRIPT_RANGES = [
     ("Telugu", 0x0C00, 0x0C7F), ("Kannada", 0x0C80, 0x0CFF),
     ("Malayalam", 0x0D00, 0x0D7F), ("Tamil", 0x0B80, 0x0BFF),
     ("Bengali", 0x0980, 0x09FF), ("Gurmukhi", 0x0A00, 0x0A7F),
     ("Gujarati", 0x0A80, 0x0AFF), ("Oriya", 0x0B00, 0x0B7F),
     ("Devanagari", 0x0900, 0x097F), ("Sinhala", 0x0D80, 0x0DFF),
-    ("Thai", 0x0E00, 0x0E7F), ("Lao", 0x0E80, 0x0EFF),
-    ("Tibetan", 0x0F00, 0x0FFF), ("Myanmar", 0x1000, 0x109F),
-    ("Georgian", 0x10A0, 0x10FF), ("Armenian", 0x0530, 0x058F),
-    ("Hebrew", 0x0590, 0x05FF), ("Arabic", 0x0600, 0x06FF),
-    ("Khmer", 0x1780, 0x17FF), ("Ethiopic", 0x1200, 0x137F),
-    ("Cherokee", 0x13A0, 0x13FF), ("Greek", 0x0370, 0x03FF),
-    ("Cyrillic", 0x0400, 0x04FF), ("Kana", 0x3040, 0x30FF),
-    ("Hangul", 0xAC00, 0xD7AF), ("Han", 0x4E00, 0x9FFF),
+    ("Greek", 0x0370, 0x03FF), ("Cyrillic", 0x0400, 0x04FF),
 ]
 
+_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+
 # ===================================================================
-# Text helpers
+# Easing Curves
+# ===================================================================
+
+def smooth_ease(p):
+    """Hermite smoothstep easing (3p^2 - 2p^3):
+    Gentle start, smooth glide, gentle stop. Zero abrupt snapping.
+    """
+    p = max(0.0, min(1.0, float(p)))
+    return p * p * (3.0 - 2.0 * p)
+
+
+def ease_out_cubic(p):
+    p = max(0.0, min(1.0, float(p)))
+    return 1.0 - math.pow(1.0 - p, 3)
+
+# ===================================================================
+# Text helpers & Language Detection
 # ===================================================================
 
 def is_telugu(text):
@@ -240,23 +264,16 @@ def is_telugu(text):
 
 
 def detect_language(text):
-    """Detect if text is Telugu, English, or mixed."""
     if not text:
         return "unknown"
-
     telugu_chars = sum(1 for ch in text if "\u0c00" <= ch <= "\u0c7f")
     total_chars = len([ch for ch in text if ch.isalpha()])
-
     if total_chars == 0:
         return "unknown"
-
     telugu_ratio = telugu_chars / total_chars
-    if telugu_ratio > 0.7:
+    if telugu_ratio > 0.4:
         return "telugu"
-    elif telugu_ratio > 0.1:
-        return "mixed"
-    else:
-        return "english"
+    return "english"
 
 
 _PUNCT_MAP = {
@@ -266,12 +283,8 @@ _PUNCT_MAP = {
     "\u2026": "...",
     "\u2022": "-", "\u25cf": "-", "\u2023": "-",
     "\u2020": "*", "\u2021": "*",
-    "\u00a7": "Sec.",
-    "\u00b6": "",
-    "\u2212": "-",
-    "\u00d7": "x",
-    "\u00f7": "/",
-    "\u00b0": " deg",
+    "\u00a7": "Sec.", "\u00b6": "", "\u2212": "-",
+    "\u00d7": "x", "\u00f7": "/", "\u00b0": " deg",
     "\u00ab": '"', "\u00bb": '"',
     "\u00a0": " ", "\u2007": " ", "\u2009": " ", "\u200a": " ", "\u2028": " ",
     "\u200b": "", "\u200c": "", "\u200d": "", "\ufeff": "",
@@ -279,12 +292,6 @@ _PUNCT_MAP = {
 
 
 def sanitize_text(text):
-    """Normalize punctuation/whitespace but KEEP all Unicode letters.
-
-    Any language must display without being mangled, so non-ASCII
-    letters are never stripped or decomposed - the font fallback chain
-    handles rendering them correctly.
-    """
     if text is None:
         return text
     for bad, good in _PUNCT_MAP.items():
@@ -313,7 +320,6 @@ def generate_hashtags(telugu_text, english_text):
     tags = list(BASE_HASHTAGS)
     tags += TELUGU_HASHTAGS if is_telugu(telugu_text) else []
     tags += ENGLISH_HASHTAGS if english_text else []
-
     for source in (english_text, telugu_text):
         tag_word = extract_reference_tag(source or "")
         if tag_word:
@@ -324,18 +330,16 @@ def generate_hashtags(telugu_text, english_text):
             if book_tag != "#" and book_tag not in tags:
                 tags.append(book_tag)
             break
-
     return tags[:10]
 
-
 # ===================================================================
-# Font resolution (bundled first, then system scan, per-script fallback)
+# Font resolution & Caching
 # ===================================================================
 
 def _scan_for_font(script_key):
     system = platform.system()
     dirs = _FONT_SCAN_DIRS.get(system, [])
-    patterns = _FONT_SCAN_PATTERNS[script_key]
+    patterns = _FONT_SCAN_PATTERNS.get(script_key, ["*.ttf"])
     for base_dir in dirs:
         if not os.path.isdir(base_dir):
             continue
@@ -364,12 +368,12 @@ def load_font(font_path, size):
     if key in _FONT_CACHE:
         return _FONT_CACHE[key]
     try:
-        if font_path:
+        if font_path and os.path.isfile(font_path):
             font = ImageFont.truetype(font_path, size)
         else:
             raise OSError("no font path resolved")
     except OSError:
-        print(f"WARNING: could not load font at '{font_path}'. Falling back to bitmap font.")
+        print(f"WARNING: Could not load font at '{font_path}'. Falling back to default.")
         font = ImageFont.load_default()
     _FONT_CACHE[key] = font
     return font
@@ -393,7 +397,6 @@ def _font_cmap(path):
 
 
 def font_covers(path, text):
-    """True if the font file has glyphs for every character in text."""
     if not path or not os.path.isfile(path):
         return False
     if not _HAS_FONTTOOLS:
@@ -408,69 +411,20 @@ def font_covers(path, text):
             return False
     return True
 
-
-def script_of(ch):
-    cp = ord(ch)
-    for name, lo, hi in _SCRIPT_RANGES:
-        if lo <= cp <= hi:
-            return name
-    return None
-
-
-_SCRIPT_FONT_CACHE = {}
-
-
-def _scan_script_font(script_name):
-    key = ("script", script_name)
-    if key in _SCRIPT_FONT_CACHE:
-        return _SCRIPT_FONT_CACHE[key]
-    found = None
-    for d in _FONT_SCAN_DIRS.get(platform.system(), []):
-        if not os.path.isdir(d):
-            continue
-        for pattern in (f"*{script_name}*Bold*.ttf", f"*{script_name}*Serif*.ttf",
-                        f"*{script_name}*.ttf", f"*{script_name}*.otf"):
-            matches = glob.glob(os.path.join(d, "**", pattern), recursive=True)
-            if matches:
-                found = sorted(matches)[0]
-                break
-        if found:
-            break
-    _SCRIPT_FONT_CACHE[key] = found
-    return found
-
-
-def font_for_word(word, default_font, default_path):
-    """Pick a font that actually covers the word's script (no tofu)."""
-    if not word.strip() or not _HAS_FONTTOOLS or not default_path:
-        return default_font
-    if font_covers(default_path, word):
-        return default_font
-    scripts = sorted({s for s in (script_of(ch) for ch in word) if s})
-    for script_name in scripts:
-        path = _scan_script_font(script_name)
-        if path and font_covers(path, word):
-            size = getattr(default_font, "size", None)
-            if size is None:
-                return default_font
-            return load_font(path, size)
-    return default_font
-
-
 # ===================================================================
-# Layout: wrapping, pagination, font sizing
+# Layout & Typography
 # ===================================================================
 
 def _char_wrap_word(draw, word, font, max_width):
-    """Hard-break a single word that alone exceeds max_width."""
     pieces = []
     current = ""
     for ch in word:
         candidate = current + ch
-        if draw.textlength(candidate, font=font) <= max_width or not current:
+        if draw.textlength(candidate, font=font) <= max_width:
             current = candidate
         else:
-            pieces.append(current)
+            if current:
+                pieces.append(current)
             current = ch
     if current:
         pieces.append(current)
@@ -478,21 +432,16 @@ def _char_wrap_word(draw, word, font, max_width):
 
 
 def wrap_text_to_lines(draw, text, font, max_width):
-    """Word-wrap text to fit max_width, with character-level fallback."""
+    if not text:
+        return [""]
+    words = text.split()
     lines = []
-    for para in text.split("\n"):
-        if para.strip() == "":
-            continue
-        words = para.split(" ")
-        current = ""
-        for word in words:
-            if not word:
-                continue
-            candidate = f"{current} {word}".strip() if current else word
-            if draw.textlength(candidate, font=font) <= max_width:
-                current = candidate
-                continue
-
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        if draw.textlength(candidate, font=font) <= max_width:
+            current = candidate
+        else:
             if current:
                 lines.append(current)
                 current = ""
@@ -502,41 +451,40 @@ def wrap_text_to_lines(draw, text, font, max_width):
                 parts = _char_wrap_word(draw, word, font, max_width)
                 lines.extend(parts[:-1])
                 current = parts[-1]
-        if current:
-            lines.append(current)
+    if current:
+        lines.append(current)
     return lines or [""]
 
 
 def paginate_lines(lines, max_lines=MAX_LINES):
-    """Group lines into pages; merge a tiny trailing orphan page into
-    the previous page when the block still fits so fragments like
-    '3:16)' never become their own slide."""
     pages = [lines[i:i + max_lines] for i in range(0, len(lines), max_lines)]
     if len(pages) >= 2:
         last = pages[-1]
         words_in_last = sum(len(l.split()) for l in last)
-        if words_in_last <= 1 and len(last) + len(pages[-2]) <= max_lines + 1:
+        if words_in_last <= 2 and len(last) + len(pages[-2]) <= max_lines + 1:
             pages[-2] = pages[-2] + last
             pages.pop()
     return pages
 
 
 def choose_font_size(total_words, video_size):
-    """Readable cinematic sizing, ~75% larger than before."""
     h = video_size[1]
-    base = int(h * 0.175)  # 0.10 * 1.75
+    is_vertical = video_size[1] > video_size[0]
+    base = int(h * (0.095 if is_vertical else 0.155))
     if total_words > 60:
-        scale = 0.52
+        scale = 0.55
     elif total_words > 40:
-        scale = 0.62
+        scale = 0.65
     elif total_words > 24:
-        scale = 0.74
+        scale = 0.76
     elif total_words > 12:
-        scale = 0.86
+        scale = 0.88
     else:
         scale = 1.0
     size = int(base * scale)
-    return max(int(h * 0.08), min(size, int(h * 0.20)))
+    min_size = int(h * (0.045 if is_vertical else 0.075))
+    max_size = int(h * (0.12 if is_vertical else 0.18))
+    return max(min_size, min(size, max_size))
 
 
 def _explanation_enabled():
@@ -544,7 +492,6 @@ def _explanation_enabled():
 
 
 def build_segments(telugu_text, english_text, explanation_text, font_telugu, font_latin, draw):
-    """Build ordered list of pages with <= MAX_LINES lines."""
     segments = []
     if telugu_text:
         segments.append((telugu_text, font_telugu))
@@ -559,38 +506,41 @@ def build_segments(telugu_text, english_text, explanation_text, font_telugu, fon
         lines = wrap_text_to_lines(draw, text, font, SAFE_TEXT_WIDTH)
         for chunk in paginate_lines(lines, MAX_LINES):
             if any(l.strip() for l in chunk):
-                pages.append({"lines": chunk, "font": font})
+                pages.append({"lines": chunk, "font": font, "raw_text": " ".join(chunk)})
     return pages
 
-
 # ===================================================================
-# Timing: line-by-line entrance (from top) + 6s hold + clean fade
+# Timing & Dynamic Scheduling
 # ===================================================================
 
-def ease_out_cubic(p):
-    p = max(0.0, min(1.0, p))
-    return 1 - (1 - p) ** 3
-
-
-def schedule_pages(pages):
+def schedule_pages(pages, audio_clips=None):
     """Assign durations summing to exactly TOTAL_DURATION.
-
-    Each page wants: entrance + HOLD_SECONDS + fade-out. When the
-    budget is tight everything scales down proportionally (never below
-    MIN_PAGE_DURATION when the math allows); with slack, holds stretch
-    so the video is exactly 45 seconds.
+    If TTS audio clips are available, the page durations dynamically
+    synchronize with the spoken narration!
     """
-    for p in pages:
+    n = len(pages)
+    if n == 0:
+        return []
+
+    # Calculate desired duration per page
+    for i, p in enumerate(pages):
         nl = max(1, p["n_lines"])
         entrance = min(ENTRANCE_CAP, (nl - 1) * LINE_STAGGER + LINE_FADE)
         p["entrance"] = entrance
         p["fade_out"] = PAGE_FADE_OUT
-        p["raw"] = entrance + HOLD_SECONDS + PAGE_FADE_OUT
 
-    n = len(pages)
-    scale = TOTAL_DURATION / sum(p["raw"] for p in pages)
+        if audio_clips and i < len(audio_clips) and audio_clips[i]:
+            # Page matches speech duration + 1.2s contemplation hold
+            speech_dur = audio_clips[i].duration
+            p["raw"] = max(MIN_PAGE_DURATION, speech_dur + 1.2 + PAGE_FADE_OUT)
+        else:
+            p["raw"] = entrance + HOLD_SECONDS + PAGE_FADE_OUT
+
+    total_raw = sum(p["raw"] for p in pages)
+    scale = TOTAL_DURATION / total_raw
     durs = [p["raw"] * scale for p in pages]
 
+    # Constrain to min page duration
     for _ in range(3):
         tight = [i for i, d in enumerate(durs) if d < MIN_PAGE_DURATION]
         if not tight:
@@ -617,43 +567,51 @@ def schedule_pages(pages):
     for p, d in zip(pages, durs):
         p["duration"] = d
         f = d / p["raw"]
-        p["fade_out"] = max(0.1, min(p["fade_out"] * f, d * 0.3))
-        p["entrance"] = max(0.2, min(p["entrance"] * f, d - p["fade_out"] - 0.1))
-        lf = max(0.08, min(LINE_FADE * f, p["entrance"] * 0.5))
+        p["fade_out"] = max(0.2, min(PAGE_FADE_OUT, d * 0.25))
+        p["entrance"] = max(0.3, min(p["entrance"] * f, d - p["fade_out"] - 0.2))
+        lf = max(0.25, min(LINE_FADE, p["entrance"] * 0.65))
         p["line_fade"] = lf
         nl = p["n_lines"]
         if nl > 1:
-            stagger = max(0.01, (p["entrance"] - lf) / (nl - 1))
+            stagger = max(0.05, (p["entrance"] - lf) / (nl - 1))
         else:
             stagger = 0.0
         p["line_starts"] = [i * stagger for i in range(nl)]
         starts.append(acc)
         acc += d
+
     return starts
 
 # ===================================================================
-# Backgrounds: gradient / image / gif / video (cover-fit + dim)
-#              (No animated overlays: no flickering borders/stars)
+# Background Engine: Nature Scenery, Ken Burns, Video Loops, Celestial
 # ===================================================================
 
-_LANCZOS = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 _VIGNETTE_MASK = None
 
 
-def _vignette_mask():
+def _get_cinematic_scrim():
+    """Generates a rich center-dimmed scrim and soft edge vignette.
+    Ensures white/gold text is 100% readable over any bright scenery.
+    """
     global _VIGNETTE_MASK
-    if _VIGNETTE_MASK is None:
-        mask = Image.new("L", VIDEO_SIZE, 0)
-        d = ImageDraw.Draw(mask)
-        d.ellipse([-VIDEO_SIZE[0] * 0.2, -VIDEO_SIZE[1] * 0.2,
-                   VIDEO_SIZE[0] * 1.2, VIDEO_SIZE[1] * 1.2], fill=255)
-        _VIGNETTE_MASK = mask.filter(
-            ImageFilter.GaussianBlur(int(140 * VIDEO_SIZE[0] / 1920)))
+    if _VIGNETTE_MASK is None or _VIGNETTE_MASK.size != VIDEO_SIZE:
+        w, h = VIDEO_SIZE
+        # Black base
+        scrim = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(scrim)
+
+        # Center reading zone opacity (lighter in center, dark around margins)
+        # Ellipse for vignette
+        draw.ellipse([-w * 0.25, -h * 0.25, w * 1.25, h * 1.25], fill=210)
+        # Inner soft scrim
+        inner_box = [int(w * 0.06), int(h * 0.08), int(w * 0.94), int(h * 0.92)]
+        draw.rounded_rectangle(inner_box, radius=int(min(w, h) * 0.1), fill=175)
+
+        _VIGNETTE_MASK = scrim.filter(ImageFilter.GaussianBlur(int(min(w, h) * 0.15)))
     return _VIGNETTE_MASK
 
 
 def _cover_resize(img):
-    """Resize + center-crop so the image exactly fills VIDEO_SIZE."""
     w, h = VIDEO_SIZE
     iw, ih = img.size
     if (iw, ih) == (w, h):
@@ -666,239 +624,323 @@ def _cover_resize(img):
     return img.crop((left, top, left + w, top + h))
 
 
-def _finish_still(img, dim):
-    """Cover-fit, optionally dim, then vignette a still background."""
-    img = _cover_resize(img.convert("RGB"))
-    if dim > 0:
-        img = Image.blend(img, Image.new("RGB", img.size, (0, 0, 0)), dim)
-    return Image.composite(img, Image.new("RGB", img.size, (0, 0, 0)),
-                           _vignette_mask())
+def _apply_scrim(img, dim_factor=IMAGE_DIM):
+    """Dims and vignettes an image so text pops with pristine contrast."""
+    w, h = VIDEO_SIZE
+    if img.size != (w, h):
+        img = _cover_resize(img)
+    dimmed = Image.blend(img.convert("RGB"), Image.new("RGB", (w, h), (0, 0, 0)), dim_factor)
+    return Image.composite(dimmed, Image.new("RGB", (w, h), (0, 0, 0)), _get_cinematic_scrim())
 
 
-_ACTIVE_PALETTE_NAME = [None]
+def make_ken_burns_image_bg(path):
+    """Cinematic Ken Burns camera motion over high-res scenery:
+    Slow, regal drone-like pan across the image at 60+ fps rendering speed.
+    """
+    w, h = VIDEO_SIZE
+    with Image.open(path) as orig:
+        orig = orig.convert("RGB")
+        # Scale to 1.12x of target size once upfront
+        scaled_w = int(w * 1.12)
+        scaled_h = int(h * 1.12)
+        base = _cover_resize(orig.resize((scaled_w, scaled_h), _LANCZOS))
 
-
-def pick_gradient_palette():
-    """Choose the gradient palette once per video: explicit theme,
-    else random. Re-uses the active choice so background and text
-    tint stay consistent (and the gradient never re-picks mid-video)."""
-    name = None
-    if BACKGROUND_THEME and BACKGROUND_THEME.lower() != "random" and BACKGROUND_THEME in GRADIENT_PALETTES:
-        name = BACKGROUND_THEME
-    if not name:
-        name = _ACTIVE_PALETTE_NAME[0]
-    if not name or name not in GRADIENT_PALETTES:
-        name = random.choice(list(GRADIENT_PALETTES.keys()))
-    _ACTIVE_PALETTE_NAME[0] = name
-    return name, GRADIENT_PALETTES[name]
-
-
-def text_accent_color():
-    """Cinematic text color matched to the active gradient palette."""
-    name = _ACTIVE_PALETTE_NAME[0]
-    if name and name in TEXT_ACCENTS:
-        return TEXT_ACCENTS[name] + (255,)
-    return DEFAULT_TEXT_ACCENT + (255,)
-
-
-def make_gradient_bg():
-    """Static gradient background built once (no per-frame flicker)."""
-    base = create_background()
+    max_x = max(0, scaled_w - w)
+    max_y = max(0, scaled_h - h)
+    scrim = _get_cinematic_scrim()
+    black = Image.new("RGB", (w, h), (0, 0, 0))
 
     def provider(t):
-        return base.copy()
+        p = t / max(1.0, TOTAL_DURATION)
+        # Gentle smooth easing for camera sweep
+        eased_p = smooth_ease(p)
+        cx = int(max_x * (0.2 + 0.6 * eased_p))
+        cy = int(max_y * (0.8 - 0.6 * eased_p))
 
-    return provider
-
-
-def create_background(t=None):
-    """Gradient background (theme-aware) with vignette."""
-    name, (top_color, bottom_color) = pick_gradient_palette()
-    print(f"Gradient palette: {name}")
-
-    background = Image.new("RGB", VIDEO_SIZE)
-    draw = ImageDraw.Draw(background)
-    for y in range(VIDEO_SIZE[1]):
-        ratio = y / VIDEO_SIZE[1]
-        r = int(top_color[0] * (1 - ratio) + bottom_color[0] * ratio)
-        g = int(top_color[1] * (1 - ratio) + bottom_color[1] * ratio)
-        b = int(top_color[2] * (1 - ratio) + bottom_color[2] * ratio)
-        draw.line([(0, y), (VIDEO_SIZE[0], y)], fill=(r, g, b))
-
-    return Image.composite(background, Image.new("RGB", VIDEO_SIZE, (0, 0, 0)),
-                           _vignette_mask())
-
-
-def _parse_duration_hint(im, default=100):
-    """Best-effort GIF frame duration in ms."""
-    d = im.info.get("duration")
-    return d if d and d > 0 else default
-
-
-def _find_bg_file(kind):
-    """Resolve a background file path: explicit env var, then any
-    matching extension inside BACKGROUND_DIR."""
-    explicit = {"image": BACKGROUND_IMAGE, "gif": BACKGROUND_GIF,
-                "video": BACKGROUND_VIDEO}[kind]
-    if explicit and os.path.isfile(explicit):
-        return explicit
-    if explicit:
-        print(f"WARNING: {kind} background '{explicit}' not found; searching {BACKGROUND_DIR}")
-    if not os.path.isdir(BACKGROUND_DIR):
-        return None
-    exts = {"image": (".jpg", ".jpeg", ".png", ".webp", ".bmp"),
-            "gif": (".gif",), "video": (".mp4", ".mov", ".mkv", ".webm", ".avi")}[kind]
-    for f in sorted(os.listdir(BACKGROUND_DIR)):
-        if f.lower().endswith(exts):
-            return os.path.join(BACKGROUND_DIR, f)
-    return None
-
-
-def make_image_bg(path):
-    """Single cover-fit dimmed still, used for every frame."""
-    with Image.open(path) as im:
-        base = _finish_still(im, IMAGE_DIM)
-
-    def provider(t):
-        return base.copy()
-
-    return provider
-
-
-def make_gif_bg(path):
-    """Precompute cover-fit dimmed GIF frames, looped over time."""
-    frames = []
-    offsets = [0.0]
-    with Image.open(path) as im:
-        n_total = getattr(im, "n_frames", 1)
-        step = max(1, math.ceil(n_total / GIF_FRAME_CAP))
-        for i in range(0, n_total, step):
-            im.seek(i)
-            frames.append(_finish_still(im, IMAGE_DIM))
-            offsets.append(offsets[-1] + max(0.02, _parse_duration_hint(im) / 1000.0))
-            if len(frames) >= GIF_FRAME_CAP:
-                break
-    if not frames:
-        base = create_background()
-
-        def provider(t):
-            return base.copy()
-
-        return provider
-    total = offsets[-1]
-
-    def provider(t):
-        tt = t % total if total > 0 else 0.0
-        k = max(0, min(bisect_right(offsets, tt) - 1, len(frames) - 1))
-        return frames[k].copy()
+        cropped = base.crop((cx, cy, cx + w, cy + h))
+        dimmed = Image.blend(cropped, black, IMAGE_DIM)
+        return Image.composite(dimmed, black, scrim)
 
     return provider
 
 
 def make_video_bg(path):
-    """Loop a muted video file, resized/cropped per frame, dimmed.
-
-    Frames are pulled lazily via VideoFileClip.get_frame and cached in
-    small a FIFO so playback stays smooth without precomputing 45s of
-    video in RAM.
-    """
+    """Loads a scenic video loop, scales to VIDEO_SIZE upfront, and loops smoothly."""
+    w, h = VIDEO_SIZE
     src = VideoFileClip(path, audio=False)
     if hasattr(src, "resized"):
-        src = src.resized(height=VIDEO_SIZE[1] if VIDEO_SIZE[1] <= VIDEO_SIZE[0] else VIDEO_SIZE[0])
-    scale = max(VIDEO_SIZE[0] / src.w, VIDEO_SIZE[1] / src.h)
-    if hasattr(src, "resized"):
-        src = src.resized(scale) if abs(scale - 1.0) > 0.01 else src
-    cache = {}
-    cache_order = []
+        src = src.resized((w, h))
+    elif hasattr(src, "resize"):
+        src = src.resize((w, h))
+
+    black = Image.new("RGB", (w, h), (0, 0, 0))
+    scrim = _get_cinematic_scrim()
 
     def provider(t):
         tt = t % max(0.1, src.duration)
-        key = int(tt * 5)  # 5 fps background is plenty; moviepy interpolates frames per call anyway
-        if key in cache:
-            frame = cache[key]
-        else:
-            frame = src.get_frame(key / 5.0)
-            cache[key] = frame
-            cache_order.append(key)
-            if len(cache_order) > 40:
-                old = cache_order.pop(0)
-                cache.pop(old, None)
+        frame = src.get_frame(tt)
         img = Image.fromarray(frame).convert("RGB")
-        img = _cover_resize(img)
-        img = Image.blend(img, Image.new("RGB", img.size, (0, 0, 0)), VIDEO_DIM)
-        return img
+        if img.size != (w, h):
+            img = _cover_resize(img)
+        dimmed = Image.blend(img, black, VIDEO_DIM)
+        return Image.composite(dimmed, black, scrim)
 
     return provider
 
 
-def resolve_background():
-    """Return (provider, mode_used) based on BACKGROUND_MODE."""
-    mode = BACKGROUND_MODE
-    if mode not in ("gradient", "image", "gif", "video"):
-        print(f"WARNING: unknown BACKGROUND_MODE '{mode}'; using gradient.")
-        mode = "gradient"
+def make_celestial_bg():
+    """Generates an atmospheric celestial motion background with
+    radiant cosmic glow and soft floating golden bokeh particles.
+    """
+    w, h = VIDEO_SIZE
+    # Base cosmic gradient
+    base = Image.new("RGB", (w, h))
+    draw = ImageDraw.Draw(base)
+    top_c = (14, 10, 38)
+    bot_c = (32, 16, 56)
+    for y in range(h):
+        r = y / h
+        draw.line([(0, y), (w, y)], fill=(
+            int(top_c[0] * (1 - r) + bot_c[0] * r),
+            int(top_c[1] * (1 - r) + bot_c[1] * r),
+            int(top_c[2] * (1 - r) + bot_c[2] * r)
+        ))
 
-    if mode == "gradient":
+    # Static celestial dust seeds
+    random.seed(42)
+    stars = []
+    for _ in range(45):
+        stars.append({
+            "x": random.uniform(0, w),
+            "y0": random.uniform(0, h),
+            "radius": random.uniform(2, 6),
+            "speed": random.uniform(12, 28),
+            "gold": random.choice([(255, 235, 160), (250, 210, 90), (220, 240, 255)])
+        })
+
+    def provider(t):
+        frame = base.copy()
+        fdraw = ImageDraw.Draw(frame)
+        for s in stars:
+            y = (s["y0"] - s["speed"] * t) % h
+            # Gentle breathing pulse
+            alpha_pulse = 0.5 + 0.5 * math.sin(t * 1.5 + s["x"])
+            r = s["radius"] * (0.8 + 0.3 * alpha_pulse)
+            fdraw.ellipse([s["x"] - r, y - r, s["x"] + r, y + r],
+                          fill=s["gold"])
+        # Soft atmospheric blur on particles
+        frame = frame.filter(ImageFilter.BoxBlur(1))
+        return _apply_scrim(frame, dim_factor=0.20)
+
+    return provider
+
+
+def make_gradient_bg():
+    """Static high-profile gradient with cinematic vignette."""
+    w, h = VIDEO_SIZE
+    name = random.choice(list(GRADIENT_PALETTES.keys()))
+    top_color, bottom_color = GRADIENT_PALETTES[name]
+    print(f"Gradient palette: {name}")
+
+    background = Image.new("RGB", VIDEO_SIZE)
+    draw = ImageDraw.Draw(background)
+    for y in range(h):
+        ratio = y / h
+        r = int(top_color[0] * (1 - ratio) + bottom_color[0] * ratio)
+        g = int(top_color[1] * (1 - ratio) + bottom_color[1] * ratio)
+        b = int(top_color[2] * (1 - ratio) + bottom_color[2] * ratio)
+        draw.line([(0, y), (w, y)], fill=(r, g, b))
+
+    final_bg = _apply_scrim(background, dim_factor=0.15)
+
+    def provider(t):
+        return final_bg.copy()
+
+    return provider
+
+
+def _find_matching_bg_file(theme_filter=None):
+    """Scans BACKGROUND_DIR for matching video or image scenery files."""
+    if not os.path.isdir(BACKGROUND_DIR):
+        return None, None
+
+    vid_exts = (".mp4", ".mov", ".webm", ".mkv")
+    img_exts = (".jpg", ".jpeg", ".png", ".webp")
+
+    all_files = sorted(os.listdir(BACKGROUND_DIR))
+    videos = [os.path.join(BACKGROUND_DIR, f) for f in all_files if f.lower().endswith(vid_exts)]
+    images = [os.path.join(BACKGROUND_DIR, f) for f in all_files if f.lower().endswith(img_exts)]
+
+    # Filter by theme if specified
+    if theme_filter and theme_filter != "random":
+        th = theme_filter.lower()
+        matched_vids = [f for f in videos if th in os.path.basename(f).lower()]
+        if matched_vids:
+            return random.choice(matched_vids), "video"
+        matched_imgs = [f for f in images if th in os.path.basename(f).lower()]
+        if matched_imgs:
+            return random.choice(matched_imgs), "image"
+
+    # Prioritize video if available, else images
+    if videos:
+        return random.choice(videos), "video"
+    if images:
+        return random.choice(images), "image"
+
+    return None, None
+
+
+def resolve_background():
+    """Returns (provider_function, mode_name) based on configuration and files."""
+    theme = BACKGROUND_THEME if BACKGROUND_THEME != "random" else None
+
+    if BACKGROUND_MODE == "video":
+        if BACKGROUND_VIDEO and os.path.isfile(BACKGROUND_VIDEO):
+            return make_video_bg(BACKGROUND_VIDEO), "video"
+        path, kind = _find_matching_bg_file(theme)
+        if path and kind == "video":
+            return make_video_bg(path), f"video ({os.path.basename(path)})"
+
+    if BACKGROUND_MODE == "image":
+        if BACKGROUND_IMAGE and os.path.isfile(BACKGROUND_IMAGE):
+            return make_ken_burns_image_bg(BACKGROUND_IMAGE), "image"
+        path, kind = _find_matching_bg_file(theme)
+        if path:
+            return make_ken_burns_image_bg(path), f"image ({os.path.basename(path)})"
+
+    if BACKGROUND_MODE == "celestial":
+        return make_celestial_bg(), "celestial"
+
+    if BACKGROUND_MODE == "gradient":
         return make_gradient_bg(), "gradient"
 
-    if mode == "image":
-        p = _find_bg_file("image")
-        if p:
-            return make_image_bg(p), "image"
-        print("WARNING: no image background found; falling back to gradient.")
+    # Default 'auto' mode: check local assets first
+    path, kind = _find_matching_bg_file(theme)
+    if path:
+        if kind == "video":
+            print(f"Loaded scenic video background: {os.path.basename(path)}")
+            return make_video_bg(path), f"video ({os.path.basename(path)})"
+        else:
+            print(f"Loaded cinematic scenery background: {os.path.basename(path)}")
+            return make_ken_burns_image_bg(path), f"image ({os.path.basename(path)})"
 
-    if mode == "gif":
-        p = _find_bg_file("gif")
-        if p:
-            return make_gif_bg(p), "gif"
-        print("WARNING: no GIF background found; falling back to gradient.")
+    # Fallback to rich celestial motion
+    print("Using celestial ambient motion background.")
+    return make_celestial_bg(), "celestial"
 
-    if mode == "video":
-        p = _find_bg_file("video")
-        if p:
-            try:
-                return make_video_bg(p), "video"
-            except Exception as e:
-                print(f"WARNING: video background failed ({e}); using gradient.")
+# ===================================================================
+# Page rendering & Line-by-Line Staggered Animations
+# ===================================================================
 
-    return make_gradient_bg(), "gradient"
-
-
-def compute_block_top(block_height, safe_top=SAFE_TOP, safe_bottom=SAFE_BOTTOM, bias=VERTICAL_BIAS):
+def compute_block_top(block_height, safe_top=SAFE_TOP, safe_bottom=SAFE_BOTTOM):
     zone_height = safe_bottom - safe_top
-    desired_center = safe_top + zone_height * bias
+    desired_center = safe_top + zone_height * 0.5
     top = desired_center - block_height / 2
     return max(safe_top, min(top, safe_bottom - block_height))
 
 
-# ===================================================================
-# Page rendering: line-by-line entrance (from top) + hold + fade
-# ===================================================================
+def _render_shaped_line(line, font_path, font_size, text_color, stroke_color, stroke_w, shadow_color):
+    """Uses HarfBuzz + FreeType for 100% accurate Indic/Telugu ligatures and matras."""
+    if not (_HAS_HARFBUZZ and font_path and os.path.isfile(font_path)):
+        return None, 0, 0
+    try:
+        face = _ft.Face(font_path)
+        face.set_char_size(font_size * 64)
+        with open(font_path, "rb") as f:
+            fontdata = f.read()
+        hb_blob = _hb.Blob(fontdata)
+        hb_face = _hb.Face(hb_blob)
+        hb_font = _hb.Font(hb_face)
+        hb_font.scale = (font_size * 64, font_size * 64)
+        buf = _hb.Buffer()
+        buf.add_str(line)
+        buf.guess_segment_properties()
+        _hb.shape(hb_font, buf)
+        infos = buf.glyph_infos
+        positions = buf.glyph_positions
+
+        total_w = sum(pos.x_advance for pos in positions) // 64
+        line_h = int(font_size * 1.8)
+        pad = int(font_size * 0.8)
+        layer_w = total_w + pad * 2
+        layer_h = line_h + pad * 2
+
+        mask = Image.new("L", (layer_w, layer_h), 0)
+        x = pad
+        y = pad + int(font_size * 1.1)
+
+        for info, pos in zip(infos, positions):
+            face.load_glyph(info.codepoint, _ft.FT_LOAD_RENDER | _ft.FT_LOAD_TARGET_NORMAL)
+            bm = face.glyph.bitmap
+            bx = x + (pos.x_offset // 64) + face.glyph.bitmap_left
+            by = y - (pos.y_offset // 64) - face.glyph.bitmap_top
+            w, h = bm.width, bm.rows
+            if w > 0 and h > 0:
+                arr = np.array(bm.buffer, dtype=np.uint8).reshape((h, w))
+                sub = mask.crop((bx, by, bx + w, by + h))
+                combined = np.maximum(np.array(sub), arr)
+                mask.paste(Image.fromarray(combined), (bx, by))
+            x += (pos.x_advance // 64)
+            y += (pos.y_advance // 64)
+
+        shadow_mask = mask.filter(ImageFilter.GaussianBlur(SHADOW_BLUR_RADIUS))
+        shadow = Image.new("RGBA", (layer_w, layer_h), shadow_color)
+        shadow.putalpha(shadow_mask)
+
+        stroke_mask = mask.filter(ImageFilter.MaxFilter(stroke_w * 2 + 1))
+        stroke = Image.new("RGBA", (layer_w, layer_h), stroke_color)
+        stroke.putalpha(stroke_mask)
+
+        main = Image.new("RGBA", (layer_w, layer_h), text_color)
+        main.putalpha(mask)
+
+        combined = Image.alpha_composite(shadow, stroke)
+        combined = Image.alpha_composite(combined, main)
+        return combined, total_w, pad
+    except Exception:
+        return None, 0, 0
+
 
 def render_page_lines(lines, font, default_font_path):
-    """Render each line of a page as its own RGBA layer positioned at
-    the top of the safe area, so lines can animate in one-by-one.
-
-    Returns (line_layers, block_info); each entry is a dict with
-    {layer (PIL RGBA), x, y} pre-rendered at full opacity.
-    """
+    """Pre-renders each line as an RGBA layer with multi-pass devotional shadow."""
     line_height = int(font.size * LINE_SPACING_MULTIPLIER)
     block_height = line_height * len(lines)
     top = compute_block_top(block_height)
 
-    text_fill = text_accent_color()
-    stroke_w = max(2, font.size // 24)
-    pad_x = int(font.size * 0.6)
+    stroke_w = max(2, font.size // 22)
+    pad_x = int(font.size * 0.8)
     pad_y = int(font.size * 0.9)
     line_layers = []
     max_line_width = 0.0
 
     measure = ImageDraw.Draw(Image.new("RGB", (10, 10)))
+
     for i, line in enumerate(lines):
         if not line.strip():
             continue
         y = top + i * line_height
-        # measure with the page font (wrap already used it)
+
+        # Check if line contains Bible reference tag e.g. (యోహాను 3:16)
+        is_ref = line.strip().startswith("(") and line.strip().endswith(")")
+        text_fill = GOLD_ACCENT + (255,) if is_ref else CREAM_WHITE + (255,)
+
+        # Try HarfBuzz shaped rendering first for pristine complex script shaping
+        shaped_layer, shaped_w, shaped_pad = _render_shaped_line(
+            line, default_font_path, font.size, text_fill, STROKE_COLOR, stroke_w, SHADOW_COLOR
+        )
+
+        if shaped_layer is not None:
+            w = shaped_w
+            max_line_width = max(max_line_width, w)
+            x = (VIDEO_SIZE[0] - w) / 2
+            line_layers.append({
+                "layer": shaped_layer,
+                "x": int(x - shaped_pad),
+                "y": int(y - shaped_pad // 2),
+            })
+            continue
+
+        # Fallback to standard Pillow rendering
         w = int(measure.textlength(line, font=font))
         max_line_width = max(max_line_width, w)
         x = (VIDEO_SIZE[0] - w) / 2
@@ -913,9 +955,11 @@ def render_page_lines(lines, font, default_font_path):
 
         tx = pad_x
         ty = pad_y // 2
-        sdraw.text((tx + 2, ty + 2), line, font=font, fill=(0, 0, 0, 160))
+
         sdraw.text((tx, ty + font.size * 0.08), line, font=font, fill=SHADOW_COLOR)
+        sdraw.text((tx + 2, ty + 3), line, font=font, fill=(0, 0, 0, 160))
         shadow = shadow.filter(ImageFilter.GaussianBlur(radius=SHADOW_BLUR_RADIUS))
+
         mdraw.text((tx, ty), line, font=font, fill=text_fill,
                    stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
 
@@ -931,101 +975,104 @@ def render_page_lines(lines, font, default_font_path):
 
 
 def apply_line_alpha(layer_img, alpha, rise_px):
-    """Fade + shift a pre-rendered line layer for its entrance."""
+    """Applies smooth opacity fade and gentle upward elevation."""
     a = np.array(layer_img)
     if alpha < 1.0:
-        a[..., 3] = (a[..., 3].astype(np.float32) * alpha).astype(np.uint8)
+        a[..., 3] = (a[..., 3].astype(np.float32) * max(0.0, min(1.0, alpha))).astype(np.uint8)
     if rise_px > 0:
         shifted = np.zeros_like(a)
         r = int(round(rise_px))
-        if r > 0 and r < a.shape[0]:
+        if 0 < r < a.shape[0]:
             shifted[r:, :, :] = a[:-r, :, :]
-        a = shifted
+            a = shifted
     return a
 
-
-def composite_rgba_over_rgb(bg_rgb_arr, layer_rgba_arr):
-    if layer_rgba_arr is None:
-        return bg_rgb_arr
-    alpha = layer_rgba_arr[..., 3:4].astype(np.float32) / 255.0
-    fg = layer_rgba_arr[..., :3].astype(np.float32)
-    bg = bg_rgb_arr.astype(np.float32)
-    out = fg * alpha + bg * (1 - alpha)
-    return out.astype(np.uint8)
-
 # ===================================================================
-# TTS: ElevenLabs integration (temp files - moviepy can't read BytesIO)
+# Neural Voice-Over (TTS): Edge-TTS & ElevenLabs
 # ===================================================================
 
-def generate_tts_audio(text, language, voice_id=None):
-    """Generate audio using ElevenLabs TTS API; returns a temp mp3 path."""
-    if not ELEVENLABS_API_KEY:
+async def _edge_tts_speak(text, voice, output_file):
+    communicate = edge_tts.Communicate(text, voice=voice, rate="-4%")
+    await communicate.save(output_file)
+
+
+def generate_tts_audio(text, language):
+    """Generates crystal-clear neural narration using free Edge-TTS (or ElevenLabs)."""
+    if not ENABLE_TTS:
         return None
     if not text or not text.strip():
         return None
 
-    voice_id = voice_id or "21m00Tcm4TlvDq8ikWAM"
+    # Try ElevenLabs first if API key is provided
+    if ELEVENLABS_API_KEY:
+        try:
+            url = "https://api.elevenlabs.io/v1/text-to-speech/21m00Tcm4TlvDq8ikWAM"
+            headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+            data = {"text": text, "model_id": "eleven_multilingual_v2"}
+            resp = requests.post(url, json=data, headers=headers, timeout=20)
+            if resp.status_code == 200:
+                fd, tmp = tempfile.mkstemp(suffix=".mp3")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(resp.content)
+                return tmp
+        except Exception as e:
+            print(f"ElevenLabs TTS failed ({e}); falling back to Edge-TTS...")
 
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-    }
-    data = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
-    }
+    # Edge-TTS (Free, no API key needed, studio neural quality)
+    if _HAS_EDGE_TTS:
+        try:
+            fd, tmp = tempfile.mkstemp(suffix=".mp3")
+            os.close(fd)
+            voice = VOICE_TELUGU if language == "telugu" else VOICE_ENGLISH
+            asyncio.run(_edge_tts_speak(text, voice, tmp))
+            return tmp
+        except Exception as e:
+            print(f"Edge-TTS narration failed: {e}")
+            return None
 
-    try:
-        print(f"Generating {language} TTS audio for: {text[:50]}...")
-        response = requests.post(url, json=data, headers=headers, timeout=60)
-        response.raise_for_status()
-        fd, tmp_path = tempfile.mkstemp(suffix=".mp3")
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(response.content)
-        return tmp_path
-    except Exception as e:
-        print(f"ERROR generating TTS: {e}")
-        return None
+    return None
 
 
-def create_tts_clips(pages, starts):
-    """Create audio clips synchronized with text pages."""
-    tts_clips = []
-    for page, start in zip(pages, starts):
-        text = " ".join(page["lines"])
-        language = detect_language(text)
-        tmp_path = generate_tts_audio(text, language)
-        if tmp_path:
+def create_tts_clips(pages):
+    """Generates speech clips for each page and returns list of AudioFileClip."""
+    if not ENABLE_TTS:
+        return [None] * len(pages)
+
+    clips = []
+    for i, p in enumerate(pages):
+        text = p.get("raw_text", " ".join(p["lines"]))
+        lang = detect_language(text)
+        print(f"Generating narration ({lang}) for Page {i + 1}: {text[:45]}...")
+        audio_path = generate_tts_audio(text, lang)
+        if audio_path and os.path.isfile(audio_path):
             try:
-                audio_clip = AudioFileClip(tmp_path)
-                audio_clip = audio_clip.with_start(start) if hasattr(audio_clip, "with_start") else audio_clip.set_start(start)
-                tts_clips.append(audio_clip)
+                clip = AudioFileClip(audio_path)
+                clips.append(clip)
             except Exception as e:
-                print(f"Error loading TTS audio: {e}")
-            finally:
-                pass  # temp file must outlive the clip; cleaned below
+                print(f"Could not load audio clip ({e})")
+                clips.append(None)
+        else:
+            clips.append(None)
 
-    if tts_clips:
-        def _cleanup():
-            for c in tts_clips:
-                p = getattr(c, "filename", None) or (c.reader.filename if getattr(c, "reader", None) else None)
+    # Register temporary files cleanup
+    def _cleanup():
+        for c in clips:
+            if c:
+                p = getattr(c, "filename", None)
                 if p and os.path.isfile(str(p)):
                     try:
+                        c.close()
                         os.remove(str(p))
                     except OSError:
                         pass
-        atexit.register(_cleanup)
-    return tts_clips if tts_clips else None
-
+    atexit.register(_cleanup)
+    return clips
 
 # ===================================================================
-# Audio: music must play until the very end of the 45s
+# Audio Mixing & Ducking
 # ===================================================================
 
 def _compat(obj, new_name, old_name, *args, **kwargs):
-    """Call whichever of moviepy's 1.x/2.x method names exists."""
     if hasattr(obj, new_name):
         return getattr(obj, new_name)(*args, **kwargs)
     return getattr(obj, old_name)(*args, **kwargs)
@@ -1041,14 +1088,13 @@ def pick_music_file():
         for f in music_files:
             if f.lower() == MUSIC_CHOICE.lower():
                 return os.path.join(MUSIC_DIR, f)
-        print(f"Warning: '{MUSIC_CHOICE}' not found, picking randomly instead.")
     return os.path.join(MUSIC_DIR, random.choice(music_files))
 
 
-def prepare_audio(music_path, duration):
-    """Return an audio clip of exactly `duration` seconds, looping if needed."""
+def prepare_audio(music_path, duration, has_voiceover=False):
+    """Loops background music and applies volume ducking if narration is active."""
     src = AudioFileClip(music_path)
-    start_offset = min(5.0, max(0.0, src.duration * 0.05))
+    start_offset = min(4.0, max(0.0, src.duration * 0.05))
     available = src.duration - start_offset
     if available <= 0:
         start_offset, available = 0.0, src.duration
@@ -1064,32 +1110,26 @@ def prepare_audio(music_path, duration):
             remaining -= take
         audio = concatenate_audioclips(clips)
 
-    return _compat(audio, "with_volume_scaled", "volumex", 0.28)
-
+    # Duck music if voice-over is talking so narration is crystal clear
+    music_vol = 0.16 if has_voiceover else 0.28
+    return _compat(audio, "with_volume_scaled", "volumex", music_vol)
 
 # ===================================================================
-# Video builder
+# Video Production Pipeline
 # ===================================================================
 
 def build_video(telugu_text, english_text, explanation_text):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(THUMBNAIL_DIR, exist_ok=True)
 
-    # Pick the gradient palette FIRST so text tint and background match
-    pick_gradient_palette()
-
     font_telugu_path = resolve_font_path(FONT_CANDIDATES_TELUGU, "telugu")
     font_latin_path = resolve_font_path(FONT_CANDIDATES_LATIN, "latin")
-    if not font_telugu_path and (telugu_text or (explanation_text and is_telugu(explanation_text))):
-        print("WARNING: no Unicode Telugu-capable font found.")
-    if not font_latin_path:
-        print("WARNING: no dedicated Latin font found.")
 
     total_words = count_words(telugu_text) + count_words(english_text)
     if explanation_text and _explanation_enabled():
         total_words += count_words(explanation_text)
-    font_size = choose_font_size(total_words, VIDEO_SIZE)
 
+    font_size = choose_font_size(total_words, VIDEO_SIZE)
     font_telugu = load_font(font_telugu_path, font_size)
     font_latin = load_font(font_latin_path, font_size)
 
@@ -1099,36 +1139,39 @@ def build_video(telugu_text, english_text, explanation_text):
     if not raw_pages:
         raise ValueError("No text content provided to render.")
 
+    # Render page line layers
     pages = []
     for p in raw_pages:
         default_font_path = font_telugu_path if p["font"] is font_telugu else font_latin_path
         line_layers, block_info = render_page_lines(p["lines"], p["font"], default_font_path)
-        n_lines = len(line_layers)
-        if n_lines == 0:
+        if not line_layers:
             continue
-        if block_info["max_width"] > SAFE_TEXT_WIDTH + 1:
-            raise ValueError(
-                f"Line width {block_info['max_width']:.0f}px exceeds safe width {SAFE_TEXT_WIDTH}px: {p['lines']!r}"
-            )
-        if block_info["top"] < SAFE_TOP - 1 or block_info["top"] + block_info["height"] > SAFE_BOTTOM + 1:
-            raise ValueError(f"Text block falls outside the vertical safe area: {p['lines']!r}")
-        pages.append({"lines": p["lines"], "font": p["font"], "line_layers": line_layers,
-                      "n_lines": n_lines, "block": block_info})
+        pages.append({
+            "lines": p["lines"],
+            "raw_text": p["raw_text"],
+            "font": p["font"],
+            "line_layers": line_layers,
+            "n_lines": len(line_layers),
+            "block": block_info
+        })
 
     if not pages:
         raise ValueError("No renderable text found after layout.")
 
-    starts = schedule_pages(pages)
+    # Generate TTS audio narration (Edge-TTS)
+    tts_audio_clips = create_tts_clips(pages)
+    starts = schedule_pages(pages, tts_audio_clips)
 
-    print(f"Prepared {len(pages)} page(s) across {TOTAL_DURATION:.1f}s "
-          f"(line-by-line entrance, {HOLD_SECONDS}s hold, clean fade):")
+    print(f"\nPrepared {len(pages)} slide(s) across {TOTAL_DURATION:.1f}s:")
     for i, (p, s) in enumerate(zip(pages, starts)):
         preview = " / ".join(p["lines"])
-        print(f"  Page {i + 1}: {s:5.2f}s -> {s + p['duration']:5.2f}s "
-              f"({p['duration']:4.2f}s, entrance {p['entrance']:.2f}s)  {preview}")
+        has_tts = "Narration ON" if (tts_audio_clips and tts_audio_clips[i]) else "Music only"
+        print(f"  Slide {i + 1}: {s:5.2f}s -> {s + p['duration']:5.2f}s "
+              f"({p['duration']:4.2f}s, entrance {p['entrance']:.2f}s) [{has_tts}] {preview}")
 
+    # Resolve Background (Scenery / Video / Celestial / Gradient)
     bg_provider, bg_mode = resolve_background()
-    print(f"Background mode: {bg_mode}")
+    print(f"\nCinematic Background Mode: {bg_mode}")
 
     def make_frame(t):
         t = min(t, TOTAL_DURATION - 1e-3)
@@ -1138,11 +1181,11 @@ def build_video(telugu_text, english_text, explanation_text):
 
         frame_img = bg_provider(t)
 
-        # page-level fade-away factor at the very end
+        # Page fade-out at end of page
         fo = page["fade_out"]
         page_alpha = 1.0
         if local_t > page["duration"] - fo:
-            page_alpha = ease_out_cubic(max(0.0, (page["duration"] - local_t) / fo))
+            page_alpha = smooth_ease(max(0.0, (page["duration"] - local_t) / fo))
 
         if page_alpha > 0.01:
             lf = page["line_fade"]
@@ -1151,10 +1194,12 @@ def build_video(telugu_text, english_text, explanation_text):
                 if lt <= 0:
                     continue
                 prog = min(1.0, lt / lf)
-                l_alpha = ease_out_cubic(prog) * page_alpha
+                # Buttery smooth Hermite easing
+                l_alpha = smooth_ease(prog) * page_alpha
                 if l_alpha <= 0.01:
                     continue
-                rise = (1 - ease_out_cubic(prog)) * LINE_RISE_PIXELS
+                # Gentle upward float
+                rise = (1.0 - smooth_ease(prog)) * LINE_RISE_PIXELS
                 arr = apply_line_alpha(line_layer["layer"], l_alpha, rise)
                 frame_img.paste(Image.fromarray(arr), (line_layer["x"], line_layer["y"]), Image.fromarray(arr))
 
@@ -1163,24 +1208,32 @@ def build_video(telugu_text, english_text, explanation_text):
     clip = VideoClip(make_frame, duration=TOTAL_DURATION)
     clip = _compat(clip, "with_fps", "set_fps", FPS)
 
-    # Audio: music for the full 45s (+ optional page-synced TTS)
+    # Composite audio (Music + Synchronized Narration)
     try:
         music_path = pick_music_file()
-        audio = prepare_audio(music_path, TOTAL_DURATION)
-        tts_clips = create_tts_clips(pages, starts)
-        if tts_clips:
-            audio = CompositeAudioClip([audio] + tts_clips)
-        clip = _compat(clip, "with_audio", "set_audio", audio)
+        has_narration = any(c is not None for c in tts_audio_clips)
+        music_clip = prepare_audio(music_path, TOTAL_DURATION, has_voiceover=has_narration)
+
+        timed_audio_clips = [music_clip]
+        for c, s in zip(tts_audio_clips, starts):
+            if c is not None:
+                # Synchronize voice start with text float entrance
+                c_timed = _compat(c, "with_start", "set_start", s + 0.3)
+                timed_audio_clips.append(c_timed)
+
+        composite_audio = CompositeAudioClip(timed_audio_clips)
+        clip = _compat(clip, "with_audio", "set_audio", composite_audio)
     except FileNotFoundError as e:
-        print(f"No background music available ({e}); rendering without audio.")
+        print(f"Audio notice: {e}. Rendering video without audio.")
 
     output_path = os.path.join(OUTPUT_DIR, "verse_video.mp4")
+    print(f"\nEncoding {VIDEO_SIZE[0]}x{VIDEO_SIZE[1]} {FPS}fps video with libx264...")
     clip.write_videofile(
         output_path,
         fps=FPS,
         codec="libx264",
         audio_codec="aac",
-        bitrate="10M",
+        bitrate="12M",
         preset="medium",
         threads=4,
         ffmpeg_params=["-pix_fmt", "yuv420p"],
@@ -1191,48 +1244,68 @@ def build_video(telugu_text, english_text, explanation_text):
 
 
 def generate_thumbnail(telugu_text, english_text, font_telugu_path, font_latin_path):
-    """Generate YouTube thumbnail."""
+    """Generates high-profile 1280x720 YouTube thumbnail."""
     thumb_size = (1280, 720)
-    bg_img = _cover_resize(create_background().resize(
-        (int(thumb_size[0] * 0.67), int(thumb_size[1] * 0.67)), _LANCZOS))
+
+    # Scenery background matching video
+    path, _ = _find_matching_bg_file()
+    if path and os.path.isfile(path):
+        with Image.open(path) as img:
+            bg_img = _apply_scrim(img.resize(thumb_size, _LANCZOS), dim_factor=0.35)
+    else:
+        bg_img = make_gradient_bg()(0).resize(thumb_size, _LANCZOS)
 
     display_text = telugu_text or english_text or "Daily Bible Verse"
-    use_telugu_font = is_telugu(display_text)
-    font_path = font_telugu_path if use_telugu_font else font_latin_path
-    font_size = int(thumb_size[1] * 0.115)
+    use_telugu = is_telugu(display_text)
+    font_path = font_telugu_path if use_telugu else font_latin_path
+    font_size = int(thumb_size[1] * 0.11)
     font = load_font(font_path, font_size)
 
     dummy_draw = ImageDraw.Draw(Image.new("RGB", (10, 10)))
-    safe_w = int(thumb_size[0] * 0.86)
+    safe_w = int(thumb_size[0] * 0.88)
     lines = wrap_text_to_lines(dummy_draw, display_text, font, safe_w)[:2]
 
-    line_height = int(font_size * 1.4)
+    line_height = int(font_size * 1.42)
     block_height = line_height * len(lines)
     top = (thumb_size[1] - block_height) // 2
 
     draw = ImageDraw.Draw(bg_img)
-    stroke_w = max(1, font_size // 30)
-    text_fill = text_accent_color()
-    for i, line in enumerate(lines):
-        w = draw.textlength(line, font=font)
-        x = (thumb_size[0] - w) / 2
-        y = top + i * line_height
-        draw.text((x, y), line, font=font, fill=text_fill,
-                  stroke_width=stroke_w, stroke_fill=(0, 0, 0))
+    stroke_w = max(2, font_size // 24)
 
-    label_font = load_font(font_latin_path, int(font_size * 0.32))
-    label = "DAILY VERSE"
-    draw.text((36, thumb_size[1] - int(font_size * 0.32) - 36), label, font=label_font,
-              fill=(235, 200, 120), stroke_width=2, stroke_fill=(0, 0, 0))
+    for i, line in enumerate(lines):
+        y = top + i * line_height
+        is_ref = line.strip().startswith("(") and line.strip().endswith(")")
+        text_fill = GOLD_ACCENT + (255,) if is_ref else CREAM_WHITE + (255,)
+
+        shaped_layer, shaped_w, shaped_pad = _render_shaped_line(
+            line, font_path, font_size, text_fill, STROKE_COLOR, stroke_w, (0, 0, 0, 240)
+        )
+        if shaped_layer is not None:
+            x = (thumb_size[0] - shaped_w) / 2
+            bg_img.paste(shaped_layer, (int(x - shaped_pad), int(y - shaped_pad // 2)), shaped_layer)
+        else:
+            w = draw.textlength(line, font=font)
+            x = (thumb_size[0] - w) / 2
+            draw.text((x + 3, y + 4), line, font=font, fill=(0, 0, 0, 240),
+                      stroke_width=stroke_w + 2, stroke_fill=(0, 0, 0, 240))
+            draw.text((x, y), line, font=font, fill=text_fill,
+                      stroke_width=stroke_w, stroke_fill=STROKE_COLOR)
+
+    # Golden badge
+    label_font = load_font(font_latin_path, int(font_size * 0.36))
+    label = "DAILY SCRIPTURE"
+    draw.rounded_rectangle([32, thumb_size[1] - int(font_size * 0.36) - 48,
+                           280, thumb_size[1] - 28], radius=8, fill=(18, 18, 24, 220))
+    draw.text((44, thumb_size[1] - int(font_size * 0.36) - 44), label, font=label_font,
+              fill=GOLD_ACCENT)
 
     timestamp = int(time.time())
     thumbnail_path = os.path.join(THUMBNAIL_DIR, f"thumbnail_{timestamp}.jpg")
     bg_img.convert("RGB").save(thumbnail_path, "JPEG", quality=95)
     return thumbnail_path
 
-
 # ===================================================================
-# Google Sheets / YouTube integration
+# Google Sheets & YouTube Upload
 # ===================================================================
 
 def get_user_credentials():
@@ -1345,25 +1418,26 @@ def upload_to_youtube(youtube, video_path, telugu_text, english_text):
     print(f"Uploaded video ID: {response['id']} (privacy: {privacy})")
     return response["id"]
 
-
 # ===================================================================
 # Entry points
 # ===================================================================
 
 def run_test_render():
     """Renders a bundled bilingual (Telugu + English) example locally."""
-    print("Running local test render (no Sheets, no YouTube upload)...")
+    print("\n--- Running Local Test Render (Cinematic Scenery + Voiceover) ---")
     telugu_text = sanitize_text(
-        "దేవుని ప్రేమ ఎంతో గొప్పది, కాబట్టి తన అద్వితీయ కుమారుని అనుగ్రహించెను; "
-        "ఆయన యందు విశ్వాసముచేత నశించక నిత్యజీవము పొందిన అతనికి ఆయనను అనుగ్రహించెను. (యోహాను 3:16)"
+        "దేవుని ప్రేమ ఎంతో గొప్పది, కాబట్టి ఆయన తన అద్వితీయ కుమారుని అనుగ్రహించెను. "
+        "(యోహాను 3:16)"
     )
     english_text = sanitize_text(
-        "For God so loved the world that he gave his one and only Son, that whoever "
-        "believes in him shall not perish but have eternal life. (John 3:16)"
+        "For God so loved the world that he gave his one and only Son. "
+        "(John 3:16)"
     )
     video_path, thumbnail_path = build_video(telugu_text, english_text, "")
+    print(f"\n==========================================")
     print(f"Test video created at:     {video_path}")
     print(f"Test thumbnail created at: {thumbnail_path}")
+    print(f"==========================================\n")
 
 
 def run_production():
@@ -1395,7 +1469,7 @@ def run_production():
     if row_number is not None:
         mark_row_used(sheets_service, row_number)
 
-    print("Done.")
+    print("Production run completed successfully.")
 
 
 def main():
